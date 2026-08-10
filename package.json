@@ -1,0 +1,18 @@
+{
+  "name": "telegram-wp-publisher",
+  "version": "1.0.0",
+  "description": "Bot de Telegram que redacta y publica noticias en WordPress (colonaldia.hn) usando ChatGPT",
+  "main": "index.js",
+  "type": "module",
+  "scripts": {
+    "start": "node index.js"
+  },
+  "dependencies": {
+    "telegraf": "^4.16.3",
+    "express": "^4.19.2",
+    "openai": "^4.56.0",
+    "dotenv": "^16.4.5",
+    "node-fetch": "^3.3.2",
+    "form-data": "^4.0.0"
+  }
+}
