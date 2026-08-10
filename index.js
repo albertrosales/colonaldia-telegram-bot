@@ -12,7 +12,13 @@ const {
   WP_URL,              // ej: https://colonaldia.hn
   WP_USER,             // tu usuario de WordPress
   WP_APP_PASSWORD,     // la Application Password generada en tu perfil de WP
-  ALLOWED_CHAT_ID,     // tu chat_id de Telegram (para que solo tú uses el bot)
+  // Quién puede usar el bot: chat_id de Telegram separados por coma
+  // Ej: "6628161101,987654321" (envíale un mensaje a @userinfobot para conseguir cada chat_id)
+  ALLOWED_CHAT_ID,
+  // Opciones de autor que se muestran al publicar: "idAutorWP:Nombre,idAutorWP:Nombre,..."
+  // El idAutorWP se ve en wp-admin/users.php (pasa el mouse sobre el nombre)
+  // Ej: "1:Alberto,5:Holert"
+  WP_AUTHORS,
   RENDER_EXTERNAL_URL, // Render la define sola en producción
   PORT = 3000,
 } = process.env;
@@ -29,10 +35,24 @@ const wpAuth = 'Basic ' + Buffer.from(`${WP_USER}:${WP_APP_PASSWORD}`).toString(
 // Borradores pendientes de confirmación, guardados en memoria por chatId
 const drafts = new Map();
 
-// ── Utilidad: verificar que solo tú puedas usar el bot ───────────────────
+// ── Quién puede usar el bot ────────────────────────────────────────────────
+function idsPermitidos() {
+  if (!ALLOWED_CHAT_ID) return null; // null = no restringe (no recomendado)
+  return ALLOWED_CHAT_ID.split(',').map(id => id.trim());
+}
 function isAllowed(ctx) {
-  if (!ALLOWED_CHAT_ID) return true; // si no se define, no restringe (no recomendado)
-  return String(ctx.chat.id) === String(ALLOWED_CHAT_ID);
+  const permitidos = idsPermitidos();
+  if (!permitidos) return true;
+  return permitidos.includes(String(ctx.chat.id));
+}
+
+// ── Lista de autores seleccionables al publicar ────────────────────────────
+function getAuthors() {
+  if (!WP_AUTHORS) return [];
+  return WP_AUTHORS.split(',').map(par => {
+    const [id, nombre] = par.split(':').map(v => v.trim());
+    return { id: Number(id), nombre };
+  }).filter(a => a.id && a.nombre);
 }
 
 // ── Traer categorías reales del sitio WordPress ───────────────────────────
@@ -96,7 +116,7 @@ async function subirImagen(buffer, filename) {
 }
 
 // ── WordPress: crear el post ──────────────────────────────────────────────
-async function crearPost({ titulo, descripcion, cuerpo, categoriaId, mediaId }) {
+async function crearPost({ titulo, descripcion, cuerpo, categoriaId, mediaId, authorId }) {
   const res = await fetch(`${WP_URL}/wp-json/wp/v2/posts`, {
     method: 'POST',
     headers: {
@@ -110,6 +130,7 @@ async function crearPost({ titulo, descripcion, cuerpo, categoriaId, mediaId }) 
       status: 'publish',
       categories: [categoriaId],
       ...(mediaId ? { featured_media: mediaId } : {}),
+      ...(authorId ? { author: authorId } : {}),
     }),
   });
 
@@ -152,11 +173,15 @@ bot.on(['photo', 'text'], async (ctx) => {
       `🏷️ Categoría: *${draft.categoriaNombre}*` +
       (photoBuffer ? '\n🖼️ Con foto adjunta' : '\n⚠️ Sin foto');
 
-    await ctx.reply(preview, {
-      parse_mode: 'Markdown',
+    await ctx.reply(preview, { parse_mode: 'Markdown' });
+
+    // Preguntamos quién publica, si hay lista de autores configurada
+    const autores = getAuthors();
+    await ctx.reply('¿Quién publica esta noticia?', {
       ...Markup.inlineKeyboard([
-        Markup.button.callback('✅ Publicar', 'confirmar'),
-        Markup.button.callback('❌ Cancelar', 'cancelar'),
+        ...autores.map(a => [Markup.button.callback(a.nombre, `autor_${a.id}`)]),
+        [Markup.button.callback('👤 Ninguno (cuenta admin)', 'autor_0')],
+        [Markup.button.callback('❌ Cancelar', 'cancelar')],
       ]),
     });
   } catch (err) {
@@ -165,12 +190,14 @@ bot.on(['photo', 'text'], async (ctx) => {
   }
 });
 
-// ── Confirmar publicación ─────────────────────────────────────────────────
-bot.action('confirmar', async (ctx) => {
+// ── Seleccionar autor y publicar ──────────────────────────────────────────
+bot.action(/^autor_(\d+)$/, async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
 
   const draft = drafts.get(ctx.chat.id);
   if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+
+  const authorId = Number(ctx.match[1]) || undefined; // 0 = sin autor específico
 
   await ctx.answerCbQuery();
   await ctx.editMessageReplyMarkup(); // quita los botones
@@ -188,6 +215,7 @@ bot.action('confirmar', async (ctx) => {
       cuerpo: draft.cuerpo,
       categoriaId: draft.categoriaId,
       mediaId,
+      authorId,
     });
 
     drafts.delete(ctx.chat.id);
