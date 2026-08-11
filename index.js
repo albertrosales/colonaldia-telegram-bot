@@ -12,8 +12,8 @@ const {
   WP_URL,
   WP_USER,
   WP_APP_PASSWORD,
-  ALLOWED_CHAT_ID,   // chat_id de Telegram separados por coma
-  WP_AUTHORS,        // "idAutorWP:Nombre,idAutorWP:Nombre,..."
+  ALLOWED_CHAT_ID,
+  WP_AUTHORS,
   RENDER_EXTERNAL_URL,
   PORT = 3000,
 } = process.env;
@@ -27,9 +27,7 @@ const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const wpAuth = 'Basic ' + Buffer.from(`${WP_USER}:${WP_APP_PASSWORD}`).toString('base64');
 
-// Borradores pendientes, guardados en memoria por chatId
 const drafts = new Map();
-// Buffer temporal para agrupar álbumes de fotos (Telegram las manda como mensajes separados)
 const mediaGroups = new Map();
 
 // ── Permisos ────────────────────────────────────────────────────────────
@@ -52,6 +50,36 @@ async function getCategories() {
   if (!res.ok) throw new Error(`No se pudieron obtener categorías: ${res.status}`);
   const data = await res.json();
   return data.map(c => ({ id: c.id, name: c.name }));
+}
+
+// ── Buscar posibles noticias duplicadas ya publicadas ──────────────────────
+async function buscarPosibleDuplicado(titulo) {
+  const res = await fetch(`${WP_URL}/wp-json/wp/v2/posts?search=${encodeURIComponent(titulo)}&per_page=5&_fields=id,title,link,date`);
+  if (!res.ok) return null;
+  const posts = await res.json();
+  if (!posts.length) return null;
+
+  const candidatos = posts.map(p => ({ titulo: p.title.rendered, link: p.link, fecha: p.date }));
+
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Te doy un título de noticia nueva y una lista de títulos ya publicados en el sitio. ' +
+          'Responde SOLO un JSON {"duplicado": true/false, "indice": N} donde indicado es el índice (0-based) ' +
+          'del título de la lista que trata sobre el MISMO hecho noticioso que el nuevo (aunque esté redactado ' +
+          'distinto), o duplicado:false e indice:null si ninguno trata del mismo hecho.',
+      },
+      { role: 'user', content: JSON.stringify({ tituloNuevo: titulo, publicados: candidatos.map(c => c.titulo) }) },
+    ],
+  });
+
+  const parsed = JSON.parse(completion.choices[0].message.content);
+  if (parsed.duplicado && candidatos[parsed.indice]) return candidatos[parsed.indice];
+  return null;
 }
 
 // ── ChatGPT: redactar la noticia ──────────────────────────────────────────
@@ -78,8 +106,13 @@ async function redactarNoticia(textoCrudo, categorias, numImagenesAMarcar) {
           'A partir del material crudo que te dan, redacta una noticia lista para publicar. ' +
           'Responde SOLO un JSON con las claves: ' +
           '"titulo" (llamativo, informativo, sin comillas), ' +
+          '"subtitulo" (una frase corta tipo bajada periodística, que amplíe el título sin repetirlo), ' +
           '"descripcion" (resumen de 1-2 frases para SEO/redes), ' +
-          '"cuerpo" (noticia completa en formato periodístico, párrafos separados por doble salto de línea), ' +
+          '"cuerpo" (noticia completa en formato periodístico, párrafos separados por doble salto de línea. ' +
+          'El PRIMER párrafo debe empezar con un dateline en este formato exacto: "Tocoa, Colón: -" seguido del ' +
+          'primer párrafo de la noticia en la misma línea. Si el texto original menciona claramente que el hecho ' +
+          'ocurrió en otro municipio del departamento de Colón, usa ese municipio en vez de Tocoa, siempre con ' +
+          'el mismo formato "Municipio, Colón: -"), ' +
           `"categorias" (array con 1 a 3 nombres EXACTOS de esta lista, las que mejor encajen: ${listaCategorias}).` +
           instruccionImagenes,
       },
@@ -95,11 +128,17 @@ async function redactarNoticia(textoCrudo, categorias, numImagenesAMarcar) {
     .filter(Boolean);
   if (idsSugeridos.length === 0) idsSugeridos = [categorias[0].id];
 
-  return { titulo: parsed.titulo, descripcion: parsed.descripcion, cuerpo: parsed.cuerpo, categoriasSugeridas: idsSugeridos };
+  return {
+    titulo: parsed.titulo,
+    subtitulo: parsed.subtitulo,
+    descripcion: parsed.descripcion,
+    cuerpo: parsed.cuerpo,
+    categoriasSugeridas: idsSugeridos,
+  };
 }
 
 // ── ChatGPT: aplicar una edición pedida por el usuario ─────────────────────
-async function editarNoticia({ titulo, descripcion, cuerpo }, instruccion) {
+async function editarNoticia({ titulo, subtitulo, descripcion, cuerpo }, instruccion) {
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
     response_format: { type: 'json_object' },
@@ -107,13 +146,14 @@ async function editarNoticia({ titulo, descripcion, cuerpo }, instruccion) {
       {
         role: 'system',
         content:
-          'Tienes una noticia ya redactada en JSON con las claves titulo, descripcion, cuerpo. ' +
+          'Tienes una noticia ya redactada en JSON con las claves titulo, subtitulo, descripcion, cuerpo. ' +
           'El usuario pide un cambio específico. Aplica SOLO ese cambio y deja el resto igual, salvo que el cambio ' +
-          'lo requiera. Si el cuerpo contiene marcadores tipo {{IMG_2}}, {{IMG_3}}, etc., consérvalos en su lugar ' +
-          'salvo que el cambio pedido afecte directamente esa parte. Responde SOLO el JSON actualizado con esas ' +
-          'mismas tres claves.',
+          'lo requiera. Conserva el formato de dateline al inicio del cuerpo ("Municipio, Colón: -") salvo que el ' +
+          'cambio pedido lo afecte directamente. Si el cuerpo contiene marcadores tipo {{IMG_2}}, {{IMG_3}}, etc., ' +
+          'consérvalos en su lugar salvo que el cambio los afecte. Responde SOLO el JSON actualizado con esas ' +
+          'mismas cuatro claves.',
       },
-      { role: 'user', content: JSON.stringify({ titulo, descripcion, cuerpo }) },
+      { role: 'user', content: JSON.stringify({ titulo, subtitulo, descripcion, cuerpo }) },
       { role: 'user', content: `Cambio pedido: ${instruccion}` },
     ],
   });
@@ -136,8 +176,8 @@ async function subirImagen(buffer, filename) {
   return { id: data.id, url: data.source_url };
 }
 
-// ── Arma el HTML del cuerpo, insertando las imágenes adicionales ──────────
-function construirCuerpoHtml(cuerpoRaw, fotosAdicionalesSubidas) {
+// ── Arma el HTML del cuerpo, con subtítulo e imágenes insertadas ──────────
+function construirCuerpoHtml(subtitulo, cuerpoRaw, fotosAdicionalesSubidas) {
   let texto = cuerpoRaw;
   const usados = new Set();
 
@@ -149,10 +189,8 @@ function construirCuerpoHtml(cuerpoRaw, fotosAdicionalesSubidas) {
     }
   });
 
-  let html = '<p>' + texto.split('\n\n').join('</p><p>') + '</p>';
+  let html = (subtitulo ? `<p><em>${subtitulo}</em></p>` : '') + '<p>' + texto.split('\n\n').join('</p><p>') + '</p>';
 
-  // Caso simple: exactamente 1 foto adicional (2 fotos en total) → va al final
-  // Cualquier imagen que no se haya usado (sin marcador) también se agrega al final
   fotosAdicionalesSubidas.forEach((foto, idx) => {
     if (!usados.has(idx)) html += `<img src="${foto.url}" alt="" />`;
   });
@@ -187,6 +225,17 @@ async function descargarFoto(ctx, fileId) {
   return Buffer.from(await res.arrayBuffer());
 }
 
+// ── UI: aviso de posible duplicado ─────────────────────────────────────────
+async function mostrarAvisoDuplicado(ctx, duplicado) {
+  await ctx.reply(
+    `⚠️ Ya existe una noticia parecida:\n\n*${duplicado.titulo}*\n${duplicado.link}\n\n¿La publico de todos modos?`,
+    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+      Markup.button.callback('✅ Publicar de todos modos', 'dup_continuar'),
+      Markup.button.callback('❌ Cancelar', 'cancelar'),
+    ]) }
+  );
+}
+
 // ── UI: mostrar selección de categorías (checklist) ────────────────────────
 async function mostrarSeleccionCategorias(ctx, draft) {
   const botones = draft.categoriasDisponibles.map(cat => {
@@ -212,8 +261,8 @@ async function mostrarPreviewFinal(ctx, draft) {
     .join(', ');
 
   const preview =
-    `📰 *${draft.titulo}*\n\n` +
-    `_${draft.descripcion}_\n\n` +
+    `📰 *${draft.titulo}*\n` +
+    `_${draft.subtitulo}_\n\n` +
     `${draft.cuerpo}\n\n` +
     `🏷️ Categorías: *${nombresCategorias}*\n` +
     `⭐ Portada: *${draft.portada ? 'Sí' : 'No'}*\n` +
@@ -245,17 +294,26 @@ async function procesarEntrada(ctx, fotosBuffers, textoCrudo) {
 
   const draft = {
     titulo: resultado.titulo,
+    subtitulo: resultado.subtitulo,
     descripcion: resultado.descripcion,
     cuerpo: resultado.cuerpo,
     categoriasDisponibles,
     categoriasSeleccionadas: resultado.categoriasSugeridas,
     portada: false,
-    fotos: fotosBuffers, // fotos[0] = portada
-    stage: 'categorias',
+    fotos: fotosBuffers,
+    stage: 'revisando_duplicado',
     msgCategorias: null,
   };
   drafts.set(ctx.chat.id, draft);
 
+  const duplicado = await buscarPosibleDuplicado(draft.titulo);
+  if (duplicado) {
+    draft.duplicadoDetectado = duplicado;
+    await mostrarAvisoDuplicado(ctx, duplicado);
+    return;
+  }
+
+  draft.stage = 'categorias';
   await mostrarSeleccionCategorias(ctx, draft);
 }
 
@@ -265,12 +323,12 @@ bot.on('text', async (ctx) => {
 
   const draft = drafts.get(ctx.chat.id);
 
-  // Si estamos esperando una instrucción de edición, la aplicamos
   if (draft && draft.stage === 'editando') {
     try {
       await ctx.reply('Aplicando el cambio...');
       const actualizado = await editarNoticia(draft, ctx.message.text);
       draft.titulo = actualizado.titulo;
+      draft.subtitulo = actualizado.subtitulo;
       draft.descripcion = actualizado.descripcion;
       draft.cuerpo = actualizado.cuerpo;
       draft.stage = 'preview';
@@ -282,7 +340,6 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  // Si no, es una noticia nueva (solo texto, sin foto)
   try {
     await procesarEntrada(ctx, [], ctx.message.text);
   } catch (err) {
@@ -295,12 +352,11 @@ bot.on('text', async (ctx) => {
 bot.on('photo', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
 
-  const photo = ctx.message.photo[ctx.message.photo.length - 1]; // mayor resolución
+  const photo = ctx.message.photo[ctx.message.photo.length - 1];
   const groupId = ctx.message.media_group_id;
   const caption = ctx.message.caption || '';
 
   if (!groupId) {
-    // Foto suelta, sin álbum
     try {
       const buffer = await descargarFoto(ctx, photo.file_id);
       await procesarEntrada(ctx, [{ buffer, filename: `telegram-${Date.now()}.jpg` }], caption);
@@ -311,7 +367,6 @@ bot.on('photo', async (ctx) => {
     return;
   }
 
-  // Foto dentro de un álbum: la bufferizamos y esperamos a que lleguen las demás
   const key = `${ctx.chat.id}_${groupId}`;
   if (!mediaGroups.has(key)) mediaGroups.set(key, { items: [], caption: '' });
   const grupo = mediaGroups.get(key);
@@ -334,6 +389,17 @@ bot.on('photo', async (ctx) => {
       ctx.reply(`Ocurrió un error: ${err.message}`);
     }
   }, 1200);
+});
+
+// ── Aviso de duplicado: continuar o cancelar ───────────────────────────────
+bot.action('dup_continuar', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+
+  await ctx.answerCbQuery();
+  draft.stage = 'categorias';
+  await mostrarSeleccionCategorias(ctx, draft);
 });
 
 // ── Toggle de categorías ────────────────────────────────────────────────────
@@ -408,7 +474,8 @@ bot.action(/^autor_(\d+)$/, async (ctx) => {
 
   try {
     let mediaId = null;
-    let cuerpoHtml = '<p>' + draft.cuerpo.split('\n\n').join('</p><p>') + '</p>';
+    let cuerpoHtml = (draft.subtitulo ? `<p><em>${draft.subtitulo}</em></p>` : '') +
+      '<p>' + draft.cuerpo.split('\n\n').join('</p><p>') + '</p>';
 
     if (draft.fotos.length > 0) {
       const portadaSubida = await subirImagen(draft.fotos[0].buffer, draft.fotos[0].filename);
@@ -419,7 +486,7 @@ bot.action(/^autor_(\d+)$/, async (ctx) => {
         for (const foto of draft.fotos.slice(1)) {
           adicionalesSubidas.push(await subirImagen(foto.buffer, foto.filename));
         }
-        cuerpoHtml = construirCuerpoHtml(draft.cuerpo, adicionalesSubidas);
+        cuerpoHtml = construirCuerpoHtml(draft.subtitulo, draft.cuerpo, adicionalesSubidas);
       }
     }
 
