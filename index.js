@@ -52,14 +52,48 @@ async function getCategories() {
   return data.map(c => ({ id: c.id, name: c.name }));
 }
 
-// ── Buscar posibles noticias duplicadas ya publicadas ──────────────────────
-async function buscarPosibleDuplicado(titulo) {
-  const res = await fetch(`${WP_URL}/wp-json/wp/v2/posts?search=${encodeURIComponent(titulo)}&per_page=5&_fields=id,title,link,date`);
-  if (!res.ok) return null;
-  const posts = await res.json();
-  if (!posts.length) return null;
+// ── Extrae palabras clave del hecho noticioso (nombres, lugares, tema) ────
+async function extraerPalabrasClave(titulo, cuerpo) {
+  const completion = await openai.chat.completions.create({
+    model: 'gpt-4o-mini',
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Lee esta noticia y extrae de 2 a 4 términos de búsqueda cortos que identifiquen el HECHO concreto ' +
+          '(nombres de personas, instituciones, lugares o el tema específico), útiles para buscarla en el buscador ' +
+          'de un sitio de noticias aunque esté redactada con otras palabras. Responde SOLO un JSON: ' +
+          '{"terminos": ["...", "..."]}.',
+      },
+      { role: 'user', content: `Título: ${titulo}\n\nCuerpo: ${cuerpo}` },
+    ],
+  });
+  const parsed = JSON.parse(completion.choices[0].message.content);
+  return Array.isArray(parsed.terminos) ? parsed.terminos.filter(Boolean) : [];
+}
 
-  const candidatos = posts.map(p => ({ titulo: p.title.rendered, link: p.link, fecha: p.date }));
+// ── Buscar posibles noticias duplicadas ya publicadas ──────────────────────
+async function buscarPosibleDuplicado(titulo, cuerpo) {
+  const terminos = await extraerPalabrasClave(titulo, cuerpo);
+  const consultas = [titulo, ...terminos];
+
+  const candidatosPorId = new Map();
+  for (const termino of consultas) {
+    try {
+      const res = await fetch(`${WP_URL}/wp-json/wp/v2/posts?search=${encodeURIComponent(termino)}&per_page=4&_fields=id,title,link,date`);
+      if (!res.ok) continue;
+      const posts = await res.json();
+      for (const p of posts) {
+        if (!candidatosPorId.has(p.id)) {
+          candidatosPorId.set(p.id, { titulo: p.title.rendered, link: p.link, fecha: p.date });
+        }
+      }
+    } catch { /* si una búsqueda falla, seguimos con las demás */ }
+  }
+
+  const candidatos = Array.from(candidatosPorId.values()).slice(0, 10);
+  if (candidatos.length === 0) return null;
 
   const completion = await openai.chat.completions.create({
     model: 'gpt-4o-mini',
@@ -68,12 +102,13 @@ async function buscarPosibleDuplicado(titulo) {
       {
         role: 'system',
         content:
-          'Te doy un título de noticia nueva y una lista de títulos ya publicados en el sitio. ' +
-          'Responde SOLO un JSON {"duplicado": true/false, "indice": N} donde indicado es el índice (0-based) ' +
-          'del título de la lista que trata sobre el MISMO hecho noticioso que el nuevo (aunque esté redactado ' +
-          'distinto), o duplicado:false e indice:null si ninguno trata del mismo hecho.',
+          'Te doy una noticia nueva (título y cuerpo) y una lista de títulos ya publicados en el sitio. ' +
+          'Responde SOLO un JSON {"duplicado": true/false, "indice": N} donde indice es el índice (0-based) ' +
+          'del título de la lista que trata sobre el MISMO hecho noticioso concreto que la noticia nueva ' +
+          '(mismo suceso, mismas personas/lugar involucrados), aunque esté redactado distinto. Si ningún título ' +
+          'trata del mismo hecho (aunque sea un tema parecido pero otro suceso), responde duplicado:false, indice:null.',
       },
-      { role: 'user', content: JSON.stringify({ tituloNuevo: titulo, publicados: candidatos.map(c => c.titulo) }) },
+      { role: 'user', content: JSON.stringify({ tituloNuevo: titulo, cuerpoNuevo: cuerpo, publicados: candidatos.map(c => c.titulo) }) },
     ],
   });
 
@@ -306,7 +341,7 @@ async function procesarEntrada(ctx, fotosBuffers, textoCrudo) {
   };
   drafts.set(ctx.chat.id, draft);
 
-  const duplicado = await buscarPosibleDuplicado(draft.titulo);
+  const duplicado = await buscarPosibleDuplicado(draft.titulo, draft.cuerpo);
   if (duplicado) {
     draft.duplicadoDetectado = duplicado;
     await mostrarAvisoDuplicado(ctx, duplicado);
