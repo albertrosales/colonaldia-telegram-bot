@@ -26,7 +26,7 @@ const MODELO_RAPIDO = process.env.OPENAI_MODEL_RAPIDO || 'gpt-4o-mini';
 
 // X (Twitter): opcional. Si faltan las credenciales, el bot simplemente no ofrece publicar en X.
 const { X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET } = process.env;
-const X_INCLUIR_ENLACE = (process.env.X_INCLUIR_ENLACE || 'si').toLowerCase() !== 'no';
+const X_INCLUIR_ENLACE = (process.env.X_INCLUIR_ENLACE || 'no').toLowerCase() === 'si';
 const xClient = (X_API_KEY && X_API_SECRET && X_ACCESS_TOKEN && X_ACCESS_SECRET)
   ? new TwitterApi({
       appKey: X_API_KEY,
@@ -727,8 +727,24 @@ function maximoTextoTuit() {
   return X_INCLUIR_ENLACE ? X_LIMITE - X_LARGO_ENLACE - 2 : X_LIMITE;
 }
 
+// Sin enlace: quita URLs y dominios (X los convierte en enlace y cobra la tarifa de tuit con enlace)
+function quitarEnlaces(texto) {
+  return texto
+    .replace(/https?:\/\/\S+/gi, '')
+    .replace(/\b(?:www\.)?[a-z0-9-]+(?:\.[a-z0-9-]+)*\.(?:hn|com|net|org|info|news|tv|co|io|me|ly)\b\S*/gi, '')
+    .replace(/[ \t]{2,}/g, ' ')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
+const REGLA_ENLACE = () => X_INCLUIR_ENLACE
+  ? 'NO incluyas enlaces (se agregan aparte).'
+  : 'NO escribas enlaces, URLs ni nombres de dominio (ni "colonaldia.hn"): X los convierte en enlace. ' +
+    'Termina con una línea corta tipo "📲 Nota completa en nuestro sitio web".';
+
 function armarTuit(texto, link) {
-  const cuerpo = recortarParaX(texto.trim(), maximoTextoTuit());
+  const limpio = X_INCLUIR_ENLACE ? texto.trim() : quitarEnlaces(texto);
+  const cuerpo = recortarParaX(limpio, maximoTextoTuit());
   return X_INCLUIR_ENLACE && link ? `${cuerpo}\n\n${link}` : cuerpo;
 }
 
@@ -746,7 +762,7 @@ async function redactarTuit({ titulo, descripcion, cuerpo, lugar }) {
           'pasó y dónde; sin exagerar ni agregar datos que no estén en la noticia; sin clickbait engañoso; ' +
           'presunción de inocencia ("presunto") si hay personas señaladas de delitos; puede empezar con un emoji ' +
           'adecuado (ej: 🔴 para hechos urgentes, 📍 para lugar) y llevar como máximo 2 hashtags relevantes al ' +
-          `final. NO incluyas enlaces (se agregan aparte). Máximo ${maximo} caracteres. ` +
+          `final. ${REGLA_ENLACE()} Máximo ${maximo} caracteres. ` +
           'Responde SOLO un JSON: {"tuit": "..."}',
       },
       {
@@ -769,7 +785,7 @@ async function editarTuit(textoActual, instruccion) {
         content:
           'Tienes un tuit de un medio de noticias. El editor te manda un mensaje: si es un tuit completo ya ' +
           'escrito por él, úsalo tal cual (sin cambiar palabras); si es una instrucción ("más corto", "quita el ' +
-          'hashtag", "menciona que..."), aplícala al tuit actual. No agregues enlaces. ' +
+          'hashtag", "menciona que..."), aplícala al tuit actual. ' + REGLA_ENLACE() + ' ' +
           `Máximo ${maximo} caracteres. Responde SOLO un JSON: {"tuit": "..."}`,
       },
       { role: 'user', content: `Tuit actual: ${textoActual}\n\nMensaje del editor: ${instruccion}` },
@@ -1148,7 +1164,7 @@ bot.action('x_editar', async (ctx) => {
   await ctx.answerCbQuery();
   await ctx.reply(
     '✏️ Escribe el tuit como lo quieres, o dime qué cambiar (ej: "más corto", "quita los hashtags", ' +
-    '"empieza con 🔴 ÚLTIMA HORA"). El enlace se agrega solo.'
+    '"empieza con 🔴 ÚLTIMA HORA").' + (X_INCLUIR_ENLACE ? ' El enlace se agrega solo.' : ' Va sin enlace ni dominio.')
   );
 });
 
