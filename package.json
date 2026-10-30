@@ -10,7 +10,7 @@
   "dependencies": {
     "telegraf": "^4.16.3",
     "express": "^4.19.2",
-    "openai": "^4.56.0",
+    "openai": "^7.45.1",
     "dotenv": "^16.4.5",
     "node-fetch": "^3.3.2",
     "form-data": "^4.0.0"

@@ -18,22 +18,27 @@ const {
   PORT = 3000,
 } = process.env;
 
+// Modelo principal: verificación con búsqueda web + redacción + ediciones.
+// Modelo rápido: tareas simples (palabras clave, comparar duplicados).
+const MODELO_PRINCIPAL = process.env.OPENAI_MODEL || 'gpt-5.4';
+const MODELO_RAPIDO = process.env.OPENAI_MODEL_RAPIDO || 'gpt-4o-mini';
+const ZONA_HORARIA = 'America/Tegucigalpa';
+
 if (!TELEGRAM_BOT_TOKEN || !OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
   console.error('Faltan variables de entorno. Revisa tu archivo .env');
   process.exit(1);
 }
 
-const bot = new Telegraf(TELEGRAM_BOT_TOKEN);
+const bot = new Telegraf(TELEGRAM_BOT_TOKEN, { handlerTimeout: 10 * 60 * 1000 });
 const openai = new OpenAI({ apiKey: OPENAI_API_KEY });
 const wpAuth = 'Basic ' + Buffer.from(`${WP_USER}:${WP_APP_PASSWORD}`).toString('base64');
 
 const drafts = new Map();
-const mediaGroups = new Map();
 
-// ── Permisos ────────────────────────────────────────────────────────────
+// ── Utilidades ─────────────────────────────────────────────────────────────
 function isAllowed(ctx) {
   if (!ALLOWED_CHAT_ID) return true;
-  return ALLOWED_CHAT_ID.split(',').map(id => id.trim()).includes(String(ctx.chat.id));
+  return ALLOWED_CHAT_ID.split(',').map(id => id.trim()).includes(String(ctx.chat?.id));
 }
 
 function getAuthors() {
@@ -44,18 +49,142 @@ function getAuthors() {
   }).filter(a => a.id && a.nombre);
 }
 
+// Escapa texto para parse_mode HTML de Telegram
+function esc(s) {
+  return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
+// Quita etiquetas/entidades HTML (títulos que vienen de WordPress)
+function limpiarHtml(s) {
+  return String(s ?? '')
+    .replace(/<[^>]+>/g, '')
+    .replace(/&#8211;/g, '–').replace(/&#8212;/g, '—')
+    .replace(/&#8220;|&#8221;/g, '"').replace(/&#8216;|&#8217;/g, "'")
+    .replace(/&quot;/g, '"').replace(/&#039;/g, "'").replace(/&amp;/g, '&');
+}
+
+function fechaHoy() {
+  return new Date().toLocaleDateString('es-HN', {
+    timeZone: ZONA_HORARIA, weekday: 'long', year: 'numeric', month: 'long', day: 'numeric',
+  });
+}
+
+// Extrae el primer objeto JSON de una respuesta de texto
+function parsearJson(texto) {
+  const inicio = texto.indexOf('{');
+  const fin = texto.lastIndexOf('}');
+  if (inicio === -1 || fin === -1) throw new Error('La IA no devolvió un JSON válido.');
+  return JSON.parse(texto.slice(inicio, fin + 1));
+}
+
+// Envía un texto largo partido en varios mensajes (límite de Telegram: 4096).
+// El teclado (botones) va solo en el último mensaje.
+async function enviarLargo(ctx, html, extra = {}) {
+  const LIMITE = 3900;
+  const partes = [];
+  let actual = '';
+  for (const linea of html.split('\n')) {
+    if ((actual + '\n' + linea).length > LIMITE && actual) {
+      partes.push(actual);
+      actual = linea;
+    } else {
+      actual = actual ? actual + '\n' + linea : linea;
+    }
+    while (actual.length > LIMITE) {
+      // línea gigante sin saltos: cortar en un espacio
+      let corte = actual.lastIndexOf(' ', LIMITE);
+      if (corte < LIMITE / 2) corte = LIMITE;
+      partes.push(actual.slice(0, corte));
+      actual = actual.slice(corte).trimStart();
+    }
+  }
+  if (actual) partes.push(actual);
+
+  for (let i = 0; i < partes.length; i++) {
+    const esUltimo = i === partes.length - 1;
+    await ctx.reply(partes[i], {
+      parse_mode: 'HTML',
+      disable_web_page_preview: true,
+      ...(esUltimo ? extra : {}),
+    });
+  }
+}
+
 // ── Categorías del sitio ───────────────────────────────────────────────────
 async function getCategories() {
   const res = await fetch(`${WP_URL}/wp-json/wp/v2/categories?per_page=100`);
   if (!res.ok) throw new Error(`No se pudieron obtener categorías: ${res.status}`);
   const data = await res.json();
-  return data.map(c => ({ id: c.id, name: c.name }));
+  return data.map(c => ({ id: c.id, name: limpiarHtml(c.name) }));
+}
+
+// ── Verificación: investiga en la web, ubica el lugar y corrobora datos ────
+async function verificarNoticia(textoCrudo) {
+  const instrucciones =
+    `Eres el editor de verificación (fact-checker) de colonaldia.hn, un periódico regional con sede en Tocoa, ` +
+    `Colón, Honduras. Hoy es ${fechaHoy()}. Te llega material crudo para publicar: puede venir de WhatsApp, ` +
+    `redes sociales, comunicados oficiales o de otros medios. El periódico NO puede publicar información falsa, ` +
+    `así que antes de redactar debes investigar en la web.\n\n` +
+    `Tareas:\n` +
+    `1. LUGAR: determina dónde ocurrió el hecho (ciudad o municipio, departamento y país). NO asumas que es de ` +
+    `Tocoa ni de Colón: muchas noticias son de otras ciudades de Honduras o de otros países. Usa las pistas del ` +
+    `texto (nombres de colonias, barrios, aldeas, instituciones, autoridades locales, hospitales, carreteras) y ` +
+    `la búsqueda web. Si no se puede determinar con razonable seguridad, deja la ciudad vacía y confianza "baja".\n` +
+    `2. HECHOS: identifica las afirmaciones verificables clave (qué pasó, cifras, nombres, cargos, fechas, ` +
+    `instituciones) y búscalas en fuentes confiables (medios reconocidos, sitios oficiales del gobierno, ` +
+    `policía, Ministerio Público, instituciones). Marca cada una como "confirmado" (una fuente confiable lo ` +
+    `respalda), "no_confirmado" (no se encontró respaldo, lo cual es normal en hechos locales muy recientes) o ` +
+    `"contradicho" (fuentes confiables dicen otra cosa; indica el dato correcto en "dato_correcto").\n` +
+    `3. ALERTAS: señala si parece noticia vieja reciclada, rumor, cadena de WhatsApp, sátira, imagen o dato ` +
+    `manipulado, acusaciones graves sin respaldo, o si el material parece copiado de otro medio (indica cuál).\n` +
+    `4. VEREDICTO: "apto" (lo esencial está confirmado o es un hecho local verosímil sin contradicciones), ` +
+    `"revisar" (hay datos sin confirmar importantes o dudas) o "no_publicar" (falso, contradicho en lo ` +
+    `esencial, viejo presentado como nuevo, o acusación grave sin ningún respaldo).\n\n` +
+    `Nunca inventes fuentes: en "fuentes" pon solo URLs que realmente encontraste en la búsqueda.\n\n` +
+    `Responde SOLO con un JSON (sin texto antes ni después) con esta forma:\n` +
+    `{"lugar":{"ciudad":"","departamento":"","pais":"","confianza":"alta|media|baja","evidencia":""},` +
+    `"fecha_del_hecho":"","es_reciente":true,` +
+    `"hechos":[{"afirmacion":"","estado":"confirmado|no_confirmado|contradicho","dato_correcto":"","nota":"","fuentes":[""]}],` +
+    `"fuente_original":"","alertas":[""],"veredicto":"apto|revisar|no_publicar","resumen":""}`;
+
+  const resp = await openai.responses.create({
+    model: MODELO_PRINCIPAL,
+    tools: [{ type: 'web_search', user_location: { type: 'approximate', country: 'HN', timezone: ZONA_HORARIA } }],
+    instructions: instrucciones,
+    input: `Material crudo recibido:\n\n${textoCrudo}`,
+    max_output_tokens: 16000,
+  });
+
+  const verificacion = parsearJson(resp.output_text || '');
+
+  // Fuentes que la búsqueda realmente consultó (citas de la API)
+  const citas = new Map();
+  for (const item of resp.output || []) {
+    if (item.type !== 'message') continue;
+    for (const c of item.content || []) {
+      for (const a of c.annotations || []) {
+        if (a.type === 'url_citation' && a.url && !citas.has(a.url)) citas.set(a.url, a.title || a.url);
+      }
+    }
+  }
+  verificacion.citas = Array.from(citas, ([url, titulo]) => ({ url, titulo }));
+  verificacion.busquedas = (resp.output || []).filter(i => i.type === 'web_search_call').length;
+  return verificacion;
+}
+
+function lugarDefinido(v) {
+  return v?.lugar?.ciudad && v.lugar.confianza !== 'baja';
+}
+
+function textoLugar(lugar) {
+  if (!lugar) return '';
+  return [lugar.ciudad, lugar.departamento, lugar.pais].filter(Boolean).join(', ');
 }
 
 // ── Extrae palabras clave del hecho noticioso (nombres, lugares, tema) ────
 async function extraerPalabrasClave(titulo, cuerpo) {
   const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: MODELO_RAPIDO,
     response_format: { type: 'json_object' },
     messages: [
       {
@@ -86,7 +215,7 @@ async function buscarPosibleDuplicado(titulo, cuerpo) {
       const posts = await res.json();
       for (const p of posts) {
         if (!candidatosPorId.has(p.id)) {
-          candidatosPorId.set(p.id, { titulo: p.title.rendered, link: p.link, fecha: p.date });
+          candidatosPorId.set(p.id, { titulo: limpiarHtml(p.title.rendered), link: p.link, fecha: p.date });
         }
       }
     } catch { /* si una búsqueda falla, seguimos con las demás */ }
@@ -96,7 +225,7 @@ async function buscarPosibleDuplicado(titulo, cuerpo) {
   if (candidatos.length === 0) return null;
 
   const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: MODELO_RAPIDO,
     response_format: { type: 'json_object' },
     messages: [
       {
@@ -117,8 +246,8 @@ async function buscarPosibleDuplicado(titulo, cuerpo) {
   return null;
 }
 
-// ── ChatGPT: redactar la noticia ──────────────────────────────────────────
-async function redactarNoticia(textoCrudo, categorias, numImagenesAMarcar) {
+// ── IA: redactar la noticia usando el material + la verificación ───────────
+async function redactarNoticia(textoCrudo, verificacion, lugar, categorias, numImagenesAMarcar) {
   const listaCategorias = categorias.map(c => c.name).join(', ');
 
   let instruccionImagenes = '';
@@ -127,31 +256,57 @@ async function redactarNoticia(textoCrudo, categorias, numImagenesAMarcar) {
     instruccionImagenes =
       ` Además tienes ${numImagenesAMarcar} imagen(es) adicional(es) para insertar DENTRO del cuerpo ` +
       `(aparte de la foto de portada, que no se menciona en el texto). Marca los lugares donde deberían ir, ` +
-      `en los puntos donde tenga más sentido editorialmente, usando exactamente estos marcadores una vez cada uno: ${marcadores}.`;
+      `en los puntos donde tenga más sentido editorialmente, usando exactamente estos marcadores una vez cada uno, ` +
+      `cada uno en su propio párrafo: ${marcadores}.`;
   }
 
+  const esHonduras = !lugar.pais || /honduras/i.test(lugar.pais);
+  const dateline = esHonduras
+    ? `${lugar.ciudad}${lugar.departamento ? ', ' + lugar.departamento : ''}: -`
+    : `${lugar.ciudad}${lugar.pais ? ', ' + lugar.pais : ''}: -`;
+
   const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: MODELO_PRINCIPAL,
     response_format: { type: 'json_object' },
     messages: [
       {
         role: 'system',
         content:
-          'Eres redactor de un portal de noticias regional en Colón, Honduras (colonaldia.hn). ' +
-          'A partir del material crudo que te dan, redacta una noticia lista para publicar. ' +
+          'Eres redactor de colonaldia.hn, un periódico regional con sede en Tocoa, Colón, Honduras. ' +
+          `Hoy es ${fechaHoy()}. Redacta una noticia lista para publicar a partir del material crudo y del ` +
+          'informe de verificación que te doy.\n\n' +
+          'Reglas de rigor periodístico (obligatorias):\n' +
+          '- Usa SOLO hechos que estén en el material o en el informe de verificación. No inventes nombres, cifras, ' +
+          'fechas, citas ni detalles.\n' +
+          '- Hechos "contradicho": NO los afirmes. Si el informe trae el dato correcto de una fuente confiable, usa ' +
+          'el dato correcto; si no, omítelos.\n' +
+          '- Hechos "no_confirmado": atribúyelos ("según información preliminar", "según reportes", "según ' +
+          'familiares", "según el comunicado de...") o omítelos si son acusaciones graves.\n' +
+          '- Personas señaladas de delitos: usa presunción de inocencia ("presunto", "supuesto").\n' +
+          '- Puedes añadir contexto breve que el informe haya CONFIRMADO con fuentes.\n' +
+          '- El material puede ser largo y venir en varias partes: léelo completo y no omitas datos importantes.\n\n' +
           'Responde SOLO un JSON con las claves: ' +
           '"titulo" (llamativo, informativo, sin comillas), ' +
           '"subtitulo" (una frase corta tipo bajada periodística, que amplíe el título sin repetirlo), ' +
           '"descripcion" (resumen de 1-2 frases para SEO/redes), ' +
           '"cuerpo" (noticia completa en formato periodístico, párrafos separados por doble salto de línea. ' +
-          'El PRIMER párrafo debe empezar con un dateline en este formato exacto: "Tocoa, Colón: -" seguido del ' +
-          'primer párrafo de la noticia en la misma línea. Si el texto original menciona claramente que el hecho ' +
-          'ocurrió en otro municipio del departamento de Colón, usa ese municipio en vez de Tocoa, siempre con ' +
-          'el mismo formato "Municipio, Colón: -"), ' +
+          `El PRIMER párrafo debe empezar EXACTAMENTE con este dateline: "${dateline}" seguido del primer ` +
+          'párrafo en la misma línea. No cambies el lugar del dateline: ya fue verificado.), ' +
           `"categorias" (array con 1 a 3 nombres EXACTOS de esta lista, las que mejor encajen: ${listaCategorias}).` +
           instruccionImagenes,
       },
-      { role: 'user', content: textoCrudo },
+      {
+        role: 'user',
+        content:
+          `LUGAR VERIFICADO: ${textoLugar(lugar)}\n\n` +
+          `INFORME DE VERIFICACIÓN:\n${JSON.stringify({
+            fecha_del_hecho: verificacion?.fecha_del_hecho,
+            hechos: verificacion?.hechos,
+            alertas: verificacion?.alertas,
+            resumen: verificacion?.resumen,
+          })}\n\n` +
+          `MATERIAL CRUDO:\n${textoCrudo}`,
+      },
     ],
   });
 
@@ -172,21 +327,21 @@ async function redactarNoticia(textoCrudo, categorias, numImagenesAMarcar) {
   };
 }
 
-// ── ChatGPT: aplicar una edición pedida por el usuario ─────────────────────
+// ── IA: aplicar una edición pedida por el usuario ─────────────────────────
 async function editarNoticia({ titulo, subtitulo, descripcion, cuerpo }, instruccion) {
   const completion = await openai.chat.completions.create({
-    model: 'gpt-4o-mini',
+    model: MODELO_PRINCIPAL,
     response_format: { type: 'json_object' },
     messages: [
       {
         role: 'system',
         content:
           'Tienes una noticia ya redactada en JSON con las claves titulo, subtitulo, descripcion, cuerpo. ' +
-          'El usuario pide un cambio específico. Aplica SOLO ese cambio y deja el resto igual, salvo que el cambio ' +
-          'lo requiera. Conserva el formato de dateline al inicio del cuerpo ("Municipio, Colón: -") salvo que el ' +
-          'cambio pedido lo afecte directamente. Si el cuerpo contiene marcadores tipo {{IMG_2}}, {{IMG_3}}, etc., ' +
-          'consérvalos en su lugar salvo que el cambio los afecte. Responde SOLO el JSON actualizado con esas ' +
-          'mismas cuatro claves.',
+          'El usuario (editor del periódico) pide un cambio específico. Aplica SOLO ese cambio y deja el resto ' +
+          'igual, salvo que el cambio lo requiera. Conserva el dateline al inicio del cuerpo ("Ciudad, ' +
+          'Departamento: -") salvo que el cambio pedido lo afecte directamente (por ejemplo, si corrige el lugar). ' +
+          'Si el cuerpo contiene marcadores tipo {{IMG_2}}, {{IMG_3}}, etc., consérvalos en su lugar salvo que el ' +
+          'cambio los afecte. Responde SOLO el JSON actualizado con esas mismas cuatro claves.',
       },
       { role: 'user', content: JSON.stringify({ titulo, subtitulo, descripcion, cuerpo }) },
       { role: 'user', content: `Cambio pedido: ${instruccion}` },
@@ -223,8 +378,11 @@ function construirCuerpoHtml(subtitulo, cuerpoRaw, fotosAdicionalesSubidas) {
       usados.add(idx);
     }
   });
+  // Marcadores sobrantes (si la IA puso más de los necesarios)
+  texto = texto.replace(/\{\{IMG_\d+\}\}/g, '');
 
   let html = (subtitulo ? `<p><em>${subtitulo}</em></p>` : '') + '<p>' + texto.split('\n\n').join('</p><p>') + '</p>';
+  html = html.replace(/<p>\s*<\/p>/g, '');
 
   fotosAdicionalesSubidas.forEach((foto, idx) => {
     if (!usados.has(idx)) html += `<img src="${foto.url}" alt="" />`;
@@ -253,18 +411,232 @@ async function crearPost({ titulo, descripcion, cuerpoHtml, categoriaIds, mediaI
   return res.json();
 }
 
-// ── Descargar una foto de Telegram ─────────────────────────────────────────
-async function descargarFoto(ctx, fileId) {
-  const fileLink = await ctx.telegram.getFileLink(fileId);
+// ── Descargar un archivo de Telegram ───────────────────────────────────────
+async function descargarArchivo(telegram, fileId) {
+  const fileLink = await telegram.getFileLink(fileId);
   const res = await fetch(fileLink.href);
+  if (!res.ok) throw new Error(`No se pudo descargar el archivo de Telegram (${res.status}).`);
   return Buffer.from(await res.arrayBuffer());
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  RECOPILACIÓN: el usuario puede mandar varios mensajes de texto (Telegram
+//  corta los textos largos en partes), fotos sueltas o álbumes, y archivos
+//  .txt. Todo se junta hasta que toca "✍️ Redactar".
+// ══════════════════════════════════════════════════════════════════════════
+function nuevoBorrador() {
+  return { stage: 'recopilando', textos: [], fotosIds: [], msgEstado: null, timerEstado: null };
+}
+
+function obtenerBorradorRecopilando(ctx) {
+  let draft = drafts.get(ctx.chat.id);
+  if (draft && draft.stage === 'recopilando') return { draft, descartado: false };
+  const descartado = !!draft;
+  draft = nuevoBorrador();
+  drafts.set(ctx.chat.id, draft);
+  return { draft, descartado };
+}
+
+function programarEstado(ctx, draft) {
+  clearTimeout(draft.timerEstado);
+  draft.timerEstado = setTimeout(() => mostrarEstadoRecopilacion(ctx, draft).catch(console.error), 1500);
+}
+
+async function mostrarEstadoRecopilacion(ctx, draft) {
+  if (drafts.get(ctx.chat.id) !== draft || draft.stage !== 'recopilando') return;
+  const caracteres = draft.textos.reduce((n, t) => n + t.texto.length, 0);
+  const texto =
+    `📥 Material recibido: ${draft.textos.length} texto(s) (${caracteres.toLocaleString('es-HN')} caracteres)` +
+    `${draft.fotosIds.length ? `, ${draft.fotosIds.length} foto(s)` : ''}.\n\n` +
+    'Puedes seguir mandando más texto o fotos. Cuando termines, toca ✍️ Redactar.';
+
+  // Se borra el aviso anterior para que los botones queden siempre abajo
+  if (draft.msgEstado) {
+    ctx.telegram.deleteMessage(ctx.chat.id, draft.msgEstado).catch(() => {});
+  }
+  const msg = await ctx.reply(texto, Markup.inlineKeyboard([
+    [Markup.button.callback('✍️ Redactar', 'redactar')],
+    [Markup.button.callback('❌ Cancelar', 'cancelar')],
+  ]));
+  draft.msgEstado = msg.message_id;
+}
+
+async function agregarMaterial(ctx, { texto, fotoId }) {
+  const { draft, descartado } = obtenerBorradorRecopilando(ctx);
+  if (descartado) {
+    await ctx.reply('ℹ️ Tenías una noticia pendiente sin publicar; la descarté y empecé una nueva con este material.');
+  }
+  const messageId = ctx.message.message_id;
+  if (texto && texto.trim()) draft.textos.push({ messageId, texto: texto.trim() });
+  if (fotoId) draft.fotosIds.push({ messageId, fileId: fotoId });
+  programarEstado(ctx, draft);
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  FLUJO PRINCIPAL
+// ══════════════════════════════════════════════════════════════════════════
+async function iniciarProceso(ctx, draft) {
+  clearTimeout(draft.timerEstado);
+  if (draft.msgEstado) ctx.telegram.deleteMessage(ctx.chat.id, draft.msgEstado).catch(() => {});
+
+  const textoCrudo = draft.textos
+    .sort((a, b) => a.messageId - b.messageId)
+    .map(t => t.texto)
+    .join('\n\n');
+
+  if (!textoCrudo.trim()) {
+    draft.msgEstado = null;
+    return ctx.reply('Todavía no me mandaste el texto de la noticia. Mándalo y luego toca ✍️ Redactar.');
+  }
+
+  draft.stage = 'procesando';
+  draft.textoCrudo = textoCrudo;
+
+  await ctx.reply(
+    `🔎 Investigando y verificando la noticia en la web (${textoCrudo.length.toLocaleString('es-HN')} caracteres` +
+    `${draft.fotosIds.length ? `, ${draft.fotosIds.length} foto(s)` : ''}). Esto puede tardar 1–2 minutos...`
+  );
+
+  // Descargar fotos en orden
+  const ordenadas = draft.fotosIds.sort((a, b) => a.messageId - b.messageId);
+  draft.fotos = [];
+  for (const f of ordenadas) {
+    const buffer = await descargarArchivo(ctx.telegram, f.fileId);
+    draft.fotos.push({ buffer, filename: `telegram-${Date.now()}-${draft.fotos.length}.jpg` });
+  }
+
+  try {
+    draft.verificacion = await verificarNoticia(textoCrudo);
+  } catch (err) {
+    console.error('Error en verificación:', err);
+    draft.verificacion = {
+      lugar: { ciudad: '', departamento: '', pais: '', confianza: 'baja', evidencia: '' },
+      hechos: [],
+      alertas: [`No se pudo verificar en la web (${err.message}). Revisa los datos manualmente.`],
+      veredicto: 'revisar',
+      resumen: '',
+      citas: [],
+      error: true,
+    };
+  }
+
+  await mostrarInformeVerificacion(ctx, draft.verificacion);
+
+  if (lugarDefinido(draft.verificacion)) {
+    draft.lugar = draft.verificacion.lugar;
+    await continuarConRedaccion(ctx, draft);
+  } else {
+    draft.stage = 'esperando_lugar';
+    await ctx.reply(
+      '📍 No pude confirmar dónde ocurrió el hecho' +
+      (draft.verificacion.lugar?.ciudad ? ` (lo más probable: ${textoLugar(draft.verificacion.lugar)}, pero no es seguro)` : '') +
+      '.\n\nEscríbeme el lugar así: Ciudad, Departamento (ej: "Trujillo, Colón" o "San Pedro Sula, Cortés"). ' +
+      'Si es fuera de Honduras: Ciudad, País.'
+    );
+  }
+}
+
+async function continuarConRedaccion(ctx, draft) {
+  draft.stage = 'procesando';
+  await ctx.reply(`✍️ Redactando la noticia (lugar: ${textoLugar(draft.lugar)})...`);
+
+  const categoriasDisponibles = await getCategories();
+  const numAdicionalesAMarcar = draft.fotos.length > 2 ? draft.fotos.length - 1 : 0;
+  const resultado = await redactarNoticia(
+    draft.textoCrudo, draft.verificacion, draft.lugar, categoriasDisponibles, numAdicionalesAMarcar
+  );
+
+  Object.assign(draft, {
+    titulo: resultado.titulo,
+    subtitulo: resultado.subtitulo,
+    descripcion: resultado.descripcion,
+    cuerpo: resultado.cuerpo,
+    categoriasDisponibles,
+    categoriasSeleccionadas: resultado.categoriasSugeridas,
+    portada: false,
+    msgCategorias: null,
+    dupAceptado: false,
+    verifAceptada: draft.verificacion.veredicto !== 'no_publicar',
+  });
+
+  draft.duplicadoDetectado = await buscarPosibleDuplicado(draft.titulo, draft.cuerpo).catch(err => {
+    console.error('Error buscando duplicados:', err);
+    return null;
+  });
+
+  await siguientePaso(ctx, draft);
+}
+
+// Decide qué mostrar según las alertas pendientes
+async function siguientePaso(ctx, draft) {
+  if (draft.duplicadoDetectado && !draft.dupAceptado) {
+    draft.stage = 'revisando_duplicado';
+    return mostrarAvisoDuplicado(ctx, draft.duplicadoDetectado);
+  }
+  if (!draft.verifAceptada) {
+    draft.stage = 'revisando_verificacion';
+    return ctx.reply(
+      '⛔ La verificación recomienda NO publicar esta noticia (revisa el informe de arriba).\n\n' +
+      '¿Quieres continuar de todos modos? Podrás revisar y editar el texto antes de publicar.',
+      Markup.inlineKeyboard([
+        [Markup.button.callback('⚠️ Continuar bajo mi responsabilidad', 'verif_continuar')],
+        [Markup.button.callback('❌ Descartar', 'cancelar')],
+      ])
+    );
+  }
+  draft.stage = 'categorias';
+  await mostrarSeleccionCategorias(ctx, draft);
+}
+
+// ── UI: informe de verificación ─────────────────────────────────────────────
+async function mostrarInformeVerificacion(ctx, v) {
+  const iconoVeredicto = { apto: '✅ Apto para publicar', revisar: '⚠️ Revisar antes de publicar', no_publicar: '⛔ No publicar' };
+  const iconoEstado = { confirmado: '✅', no_confirmado: '❓', contradicho: '❌' };
+
+  let html = '<b>🔎 Informe de verificación</b>\n\n';
+  html += `<b>Veredicto:</b> ${iconoVeredicto[v.veredicto] || esc(v.veredicto)}\n`;
+  if (v.lugar?.ciudad) {
+    html += `<b>📍 Lugar:</b> ${esc(textoLugar(v.lugar))} <i>(confianza ${esc(v.lugar.confianza)})</i>\n`;
+    if (v.lugar.evidencia) html += `<i>${esc(v.lugar.evidencia)}</i>\n`;
+  } else {
+    html += '<b>📍 Lugar:</b> no determinado\n';
+  }
+  if (v.fecha_del_hecho) html += `<b>📅 Fecha del hecho:</b> ${esc(v.fecha_del_hecho)}${v.es_reciente === false ? ' ⚠️ <b>no es reciente</b>' : ''}\n`;
+  if (v.fuente_original) html += `<b>📰 Fuente original probable:</b> ${esc(v.fuente_original)}\n`;
+  if (v.resumen) html += `\n${esc(v.resumen)}\n`;
+
+  if (v.hechos?.length) {
+    html += '\n<b>Datos revisados:</b>\n';
+    for (const h of v.hechos) {
+      html += `${iconoEstado[h.estado] || '•'} ${esc(h.afirmacion)}`;
+      if (h.estado === 'contradicho' && h.dato_correcto) html += ` → <b>dato correcto:</b> ${esc(h.dato_correcto)}`;
+      if (h.nota) html += ` <i>(${esc(h.nota)})</i>`;
+      const fuentes = (h.fuentes || []).filter(u => /^https?:\/\//.test(u)).slice(0, 2);
+      if (fuentes.length) html += ' ' + fuentes.map((u, i) => `<a href="${esc(u)}">[${i + 1}]</a>`).join(' ');
+      html += '\n';
+    }
+  }
+
+  const alertas = (v.alertas || []).filter(Boolean);
+  if (alertas.length) {
+    html += '\n<b>⚠️ Alertas:</b>\n' + alertas.map(a => `• ${esc(a)}`).join('\n') + '\n';
+  }
+
+  if (v.citas?.length) {
+    html += `\n<b>Fuentes consultadas</b> (${v.busquedas || 0} búsqueda(s)):\n`;
+    html += v.citas.slice(0, 8).map(c => `• <a href="${esc(c.url)}">${esc(c.titulo)}</a>`).join('\n');
+  } else if (!v.error) {
+    html += '\n<i>No se encontraron fuentes en la web sobre este hecho.</i>';
+  }
+
+  await enviarLargo(ctx, html);
 }
 
 // ── UI: aviso de posible duplicado ─────────────────────────────────────────
 async function mostrarAvisoDuplicado(ctx, duplicado) {
   await ctx.reply(
-    `⚠️ Ya existe una noticia parecida:\n\n*${duplicado.titulo}*\n${duplicado.link}\n\n¿La publico de todos modos?`,
-    { parse_mode: 'Markdown', ...Markup.inlineKeyboard([
+    `⚠️ Ya existe una noticia parecida:\n\n<b>${esc(duplicado.titulo)}</b>\n${esc(duplicado.link)}\n\n¿La publico de todos modos?`,
+    { parse_mode: 'HTML', disable_web_page_preview: true, ...Markup.inlineKeyboard([
       Markup.button.callback('✅ Publicar de todos modos', 'dup_continuar'),
       Markup.button.callback('❌ Cancelar', 'cancelar'),
     ]) }
@@ -295,153 +667,189 @@ async function mostrarPreviewFinal(ctx, draft) {
     .map(c => c.name)
     .join(', ');
 
+  const iconoVeredicto = { apto: '✅ Apto', revisar: '⚠️ Revisar', no_publicar: '⛔ No publicar' };
+
   const preview =
-    `📰 *${draft.titulo}*\n` +
-    `_${draft.subtitulo}_\n\n` +
-    `${draft.cuerpo}\n\n` +
-    `🏷️ Categorías: *${nombresCategorias}*\n` +
-    `⭐ Portada: *${draft.portada ? 'Sí' : 'No'}*\n` +
+    `📰 <b>${esc(draft.titulo)}</b>\n` +
+    `<i>${esc(draft.subtitulo)}</i>\n\n` +
+    `${esc(draft.cuerpo)}\n\n` +
+    `🏷️ Categorías: <b>${esc(nombresCategorias)}</b>\n` +
+    `📍 Lugar: <b>${esc(textoLugar(draft.lugar))}</b>\n` +
+    `🔎 Verificación: <b>${iconoVeredicto[draft.verificacion?.veredicto] || '—'}</b>\n` +
+    `⭐ Portada: <b>${draft.portada ? 'Sí' : 'No'}</b>\n` +
     (draft.fotos.length ? `🖼️ ${draft.fotos.length} foto(s) adjunta(s)` : '⚠️ Sin fotos');
 
   const autores = getAuthors();
-  await ctx.reply(preview, {
-    parse_mode: 'Markdown',
-    ...Markup.inlineKeyboard([
-      [Markup.button.callback('✏️ Editar', 'editar')],
-      ...autores.map(a => [Markup.button.callback(`✅ Publicar como ${a.nombre}`, `autor_${a.id}`)]),
-      [Markup.button.callback('✅ Publicar (cuenta admin)', 'autor_0')],
-      [Markup.button.callback('❌ Cancelar', 'cancelar')],
-    ]),
+  await enviarLargo(ctx, preview, Markup.inlineKeyboard([
+    [Markup.button.callback('✏️ Editar', 'editar')],
+    ...autores.map(a => [Markup.button.callback(`✅ Publicar como ${a.nombre}`, `autor_${a.id}`)]),
+    [Markup.button.callback('✅ Publicar (cuenta admin)', 'autor_0')],
+    [Markup.button.callback('❌ Cancelar', 'cancelar')],
+  ]));
+}
+
+// Ejecuta un proceso largo sin bloquear el webhook de Telegram
+function enSegundoPlano(ctx, draft, fn) {
+  fn().catch(async (err) => {
+    console.error(err);
+    if (draft && drafts.get(ctx.chat.id) === draft && draft.stage === 'procesando') {
+      // Permite reintentar sin perder el material
+      draft.stage = 'recopilando';
+      draft.msgEstado = null;
+      await ctx.reply(`Ocurrió un error: ${err.message}`).catch(() => {});
+      await mostrarEstadoRecopilacion(ctx, draft).catch(() => {});
+    } else {
+      await ctx.reply(`Ocurrió un error: ${err.message}`).catch(() => {});
+    }
   });
 }
 
-// ── Procesa una entrada nueva (texto solo, o texto + 1 o varias fotos) ────
-async function procesarEntrada(ctx, fotosBuffers, textoCrudo) {
-  if (!textoCrudo || !textoCrudo.trim()) {
-    return ctx.reply('Mándame el texto de la noticia (puede ir junto con la(s) foto(s), como pie de foto).');
-  }
+// ══════════════════════════════════════════════════════════════════════════
+//  HANDLERS DE TELEGRAM
+// ══════════════════════════════════════════════════════════════════════════
+const AYUDA =
+  '👋 Mándame la noticia: puedes pegar textos largos (aunque Telegram los parta en varios mensajes), ' +
+  'enviar varias fotos o un álbum, o un archivo .txt. Todo se junta en un solo borrador.\n\n' +
+  'Cuando termines, toca ✍️ Redactar (o escribe /listo). Antes de redactar, investigo el hecho en la web, ' +
+  'confirmo dónde ocurrió y corroboro los datos.\n\n' +
+  'Comandos: /listo para redactar, /cancelar para descartar.';
 
-  await ctx.reply(`Redactando noticia con IA${fotosBuffers.length ? ` (${fotosBuffers.length} foto(s))` : ''}, un momento...`);
+bot.start((ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  return ctx.reply(AYUDA);
+});
+bot.help((ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  return ctx.reply(AYUDA);
+});
 
-  const categoriasDisponibles = await getCategories();
-  const numAdicionalesAMarcar = fotosBuffers.length > 2 ? fotosBuffers.length - 1 : 0;
-  const resultado = await redactarNoticia(textoCrudo, categoriasDisponibles, numAdicionalesAMarcar);
+bot.command('listo', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (!draft || draft.stage !== 'recopilando') return ctx.reply('No hay material pendiente. Mándame la noticia primero.');
+  enSegundoPlano(ctx, draft, () => iniciarProceso(ctx, draft));
+});
 
-  const draft = {
-    titulo: resultado.titulo,
-    subtitulo: resultado.subtitulo,
-    descripcion: resultado.descripcion,
-    cuerpo: resultado.cuerpo,
-    categoriasDisponibles,
-    categoriasSeleccionadas: resultado.categoriasSugeridas,
-    portada: false,
-    fotos: fotosBuffers,
-    stage: 'revisando_duplicado',
-    msgCategorias: null,
-  };
-  drafts.set(ctx.chat.id, draft);
-
-  const duplicado = await buscarPosibleDuplicado(draft.titulo, draft.cuerpo);
-  if (duplicado) {
-    draft.duplicadoDetectado = duplicado;
-    await mostrarAvisoDuplicado(ctx, duplicado);
-    return;
-  }
-
-  draft.stage = 'categorias';
-  await mostrarSeleccionCategorias(ctx, draft);
-}
+bot.command('cancelar', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (draft) clearTimeout(draft.timerEstado);
+  drafts.delete(ctx.chat.id);
+  await ctx.reply('❌ Noticia descartada.');
+});
 
 // ── Mensajes de texto ──────────────────────────────────────────────────────
 bot.on('text', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
 
   const draft = drafts.get(ctx.chat.id);
+  const texto = ctx.message.text;
 
-  if (draft && draft.stage === 'editando') {
-    try {
+  if (draft?.stage === 'procesando') {
+    return ctx.reply('⏳ Estoy trabajando en la noticia, espera un momento.');
+  }
+
+  if (draft?.stage === 'esperando_lugar') {
+    const partes = texto.split(',').map(p => p.trim()).filter(Boolean);
+    if (!partes.length) return ctx.reply('Escríbeme el lugar así: Ciudad, Departamento.');
+    const esExtranjero = partes[1] && !/^(atl[aá]ntida|choluteca|col[oó]n|comayagua|cop[aá]n|cort[eé]s|el para[ií]so|francisco moraz[aá]n|gracias a dios|intibuc[aá]|islas de la bah[ií]a|la paz|lempira|ocotepeque|olancho|santa b[aá]rbara|valle|yoro)$/i.test(partes[1]);
+    draft.lugar = esExtranjero
+      ? { ciudad: partes[0], departamento: '', pais: partes[1] }
+      : { ciudad: partes[0], departamento: partes[1] || '', pais: 'Honduras' };
+    enSegundoPlano(ctx, draft, () => continuarConRedaccion(ctx, draft));
+    return;
+  }
+
+  if (draft?.stage === 'editando') {
+    enSegundoPlano(ctx, draft, async () => {
       await ctx.reply('Aplicando el cambio...');
-      const actualizado = await editarNoticia(draft, ctx.message.text);
+      const actualizado = await editarNoticia(draft, texto);
       draft.titulo = actualizado.titulo;
       draft.subtitulo = actualizado.subtitulo;
       draft.descripcion = actualizado.descripcion;
       draft.cuerpo = actualizado.cuerpo;
       draft.stage = 'preview';
       await mostrarPreviewFinal(ctx, draft);
-    } catch (err) {
-      console.error(err);
-      ctx.reply(`Ocurrió un error al editar: ${err.message}`);
-    }
+    });
     return;
   }
 
-  try {
-    await procesarEntrada(ctx, [], ctx.message.text);
-  } catch (err) {
-    console.error(err);
-    ctx.reply(`Ocurrió un error: ${err.message}`);
-  }
+  await agregarMaterial(ctx, { texto });
 });
 
-// ── Mensajes con foto (agrupa álbumes antes de procesar) ───────────────────
+// ── Fotos (sueltas o en álbum) ─────────────────────────────────────────────
 bot.on('photo', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (draft?.stage === 'procesando') return ctx.reply('⏳ Estoy trabajando en la noticia, espera un momento.');
 
   const photo = ctx.message.photo[ctx.message.photo.length - 1];
-  const groupId = ctx.message.media_group_id;
-  const caption = ctx.message.caption || '';
-
-  if (!groupId) {
-    try {
-      const buffer = await descargarFoto(ctx, photo.file_id);
-      await procesarEntrada(ctx, [{ buffer, filename: `telegram-${Date.now()}.jpg` }], caption);
-    } catch (err) {
-      console.error(err);
-      ctx.reply(`Ocurrió un error: ${err.message}`);
-    }
-    return;
-  }
-
-  const key = `${ctx.chat.id}_${groupId}`;
-  if (!mediaGroups.has(key)) mediaGroups.set(key, { items: [], caption: '' });
-  const grupo = mediaGroups.get(key);
-  grupo.items.push({ message_id: ctx.message.message_id, file_id: photo.file_id });
-  if (caption) grupo.caption = caption;
-
-  clearTimeout(grupo.timer);
-  grupo.timer = setTimeout(async () => {
-    mediaGroups.delete(key);
-    try {
-      const ordenadas = grupo.items.sort((a, b) => a.message_id - b.message_id);
-      const fotos = [];
-      for (const item of ordenadas) {
-        const buffer = await descargarFoto(ctx, item.file_id);
-        fotos.push({ buffer, filename: `telegram-${Date.now()}-${fotos.length}.jpg` });
-      }
-      await procesarEntrada(ctx, fotos, grupo.caption);
-    } catch (err) {
-      console.error(err);
-      ctx.reply(`Ocurrió un error: ${err.message}`);
-    }
-  }, 1200);
+  await agregarMaterial(ctx, { texto: ctx.message.caption || '', fotoId: photo.file_id });
 });
 
-// ── Aviso de duplicado: continuar o cancelar ───────────────────────────────
+// ── Documentos: .txt (texto largo) o imágenes enviadas como archivo ───────
+bot.on('document', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (draft?.stage === 'procesando') return ctx.reply('⏳ Estoy trabajando en la noticia, espera un momento.');
+
+  const doc = ctx.message.document;
+  const nombre = doc.file_name || '';
+  const mime = doc.mime_type || '';
+
+  if (mime.startsWith('image/')) {
+    return agregarMaterial(ctx, { texto: ctx.message.caption || '', fotoId: doc.file_id });
+  }
+
+  if (mime.startsWith('text/') || /\.(txt|md)$/i.test(nombre)) {
+    if (doc.file_size > 2 * 1024 * 1024) return ctx.reply('El archivo es muy grande (máximo 2 MB).');
+    try {
+      const buffer = await descargarArchivo(ctx.telegram, doc.file_id);
+      const contenido = buffer.toString('utf8');
+      const texto = [ctx.message.caption, contenido].filter(Boolean).join('\n\n');
+      return agregarMaterial(ctx, { texto });
+    } catch (err) {
+      console.error(err);
+      return ctx.reply(`No pude leer el archivo: ${err.message}`);
+    }
+  }
+
+  return ctx.reply('Solo acepto archivos de texto (.txt) o imágenes. Para Word, copia y pega el texto.');
+});
+
+// ── Botón: Redactar ─────────────────────────────────────────────────────────
+bot.action('redactar', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (!draft || draft.stage !== 'recopilando') return ctx.answerCbQuery('No hay material pendiente.');
+  await ctx.answerCbQuery();
+  enSegundoPlano(ctx, draft, () => iniciarProceso(ctx, draft));
+});
+
+// ── Aviso de duplicado / verificación: continuar ───────────────────────────
 bot.action('dup_continuar', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
   const draft = drafts.get(ctx.chat.id);
-  if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
-
+  if (!draft || draft.stage !== 'revisando_duplicado') return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
   await ctx.answerCbQuery();
-  draft.stage = 'categorias';
-  await mostrarSeleccionCategorias(ctx, draft);
+  draft.dupAceptado = true;
+  await siguientePaso(ctx, draft);
+});
+
+bot.action('verif_continuar', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (!draft || draft.stage !== 'revisando_verificacion') return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+  await ctx.answerCbQuery();
+  draft.verifAceptada = true;
+  await siguientePaso(ctx, draft);
 });
 
 // ── Toggle de categorías ────────────────────────────────────────────────────
 bot.action(/^cat_(\d+)$/, async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
   const draft = drafts.get(ctx.chat.id);
-  if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+  if (!draft || !draft.categoriasDisponibles) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
 
   const id = Number(ctx.match[1]);
   if (draft.categoriasSeleccionadas.includes(id)) {
@@ -456,7 +864,7 @@ bot.action(/^cat_(\d+)$/, async (ctx) => {
 bot.action('cat_continuar', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
   const draft = drafts.get(ctx.chat.id);
-  if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+  if (!draft || !draft.categoriasDisponibles) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
 
   if (draft.categoriasSeleccionadas.length === 0) {
     return ctx.answerCbQuery('Elige al menos una categoría.');
@@ -474,7 +882,7 @@ bot.action('cat_continuar', async (ctx) => {
 bot.action(/^portada_(si|no)$/, async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
   const draft = drafts.get(ctx.chat.id);
-  if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+  if (!draft || !draft.titulo) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
 
   draft.portada = ctx.match[1] === 'si';
   draft.stage = 'preview';
@@ -486,13 +894,13 @@ bot.action(/^portada_(si|no)$/, async (ctx) => {
 bot.action('editar', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
   const draft = drafts.get(ctx.chat.id);
-  if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+  if (!draft || !draft.titulo) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
 
   draft.stage = 'editando';
   await ctx.answerCbQuery();
   await ctx.reply(
     '✏️ Escribe qué quieres cambiar (ej: "cambia el título a...", "acorta la descripción", ' +
-    '"agrega un párrafo sobre..."). Te muestro la noticia actualizada después.'
+    '"el hecho fue en Trujillo, no en Tocoa", "agrega un párrafo sobre..."). Te muestro la noticia actualizada después.'
   );
 });
 
@@ -500,17 +908,17 @@ bot.action('editar', async (ctx) => {
 bot.action(/^autor_(\d+)$/, async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
   const draft = drafts.get(ctx.chat.id);
-  if (!draft) return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
+  if (!draft || draft.stage !== 'preview') return ctx.answerCbQuery('No hay ninguna noticia pendiente.');
 
   const authorId = Number(ctx.match[1]) || undefined;
+  draft.stage = 'publicando';
 
   await ctx.answerCbQuery();
   await ctx.reply('Publicando en colonaldia.hn...');
 
   try {
     let mediaId = null;
-    let cuerpoHtml = (draft.subtitulo ? `<p><em>${draft.subtitulo}</em></p>` : '') +
-      '<p>' + draft.cuerpo.split('\n\n').join('</p><p>') + '</p>';
+    let cuerpoHtml = construirCuerpoHtml(draft.subtitulo, draft.cuerpo, []);
 
     if (draft.fotos.length > 0) {
       const portadaSubida = await subirImagen(draft.fotos[0].buffer, draft.fotos[0].filename);
@@ -539,6 +947,7 @@ bot.action(/^autor_(\d+)$/, async (ctx) => {
     await ctx.reply(`✅ Publicado: ${post.link}`);
   } catch (err) {
     console.error(err);
+    draft.stage = 'preview';
     await ctx.reply(`Error al publicar: ${err.message}`);
   }
 });
@@ -546,9 +955,16 @@ bot.action(/^autor_(\d+)$/, async (ctx) => {
 // ── Cancelar ─────────────────────────────────────────────────────────────
 bot.action('cancelar', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (draft) clearTimeout(draft.timerEstado);
   drafts.delete(ctx.chat.id);
   await ctx.answerCbQuery('Cancelado');
   await ctx.reply('❌ Noticia descartada.');
+});
+
+bot.catch((err, ctx) => {
+  console.error('Error no controlado:', err);
+  ctx?.reply?.(`Ocurrió un error: ${err.message}`).catch(() => {});
 });
 
 // ── Servidor Express + Webhook de Telegram (para Render) ─────────────────
@@ -560,6 +976,7 @@ app.get('/', (req, res) => res.send('Bot activo.'));
 
 app.listen(PORT, async () => {
   console.log(`Servidor escuchando en el puerto ${PORT}`);
+  console.log(`Modelo principal: ${MODELO_PRINCIPAL} | Modelo rápido: ${MODELO_RAPIDO}`);
   if (RENDER_EXTERNAL_URL) {
     const webhookUrl = `${RENDER_EXTERNAL_URL}${webhookPath}`;
     await bot.telegram.setWebhook(webhookUrl);

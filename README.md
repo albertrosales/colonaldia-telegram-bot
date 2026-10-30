@@ -6,10 +6,20 @@ Bot de Telegram que recibe una noticia cruda (texto + foto opcional), la redacta
 
 ## Cómo funciona
 
-1. Le mandas al bot el texto de la noticia (como pie de foto, o como mensaje de texto).
-2. El bot llama a ChatGPT para redactarla y elegir la categoría (de las categorías reales de tu sitio).
-3. Te devuelve un preview con botones ✅ Publicar / ❌ Cancelar.
-4. Si confirmas, sube la foto y crea el post publicado en tu sitio.
+1. Le mandas al bot el material: texto (aunque sea largo y Telegram lo parta en varios mensajes),
+   fotos sueltas o en álbum, o un archivo `.txt`. Todo se junta en un solo borrador.
+2. Tocas **✍️ Redactar** (o escribes `/listo`).
+3. **Verificación:** la IA investiga en la web (herramienta `web_search` de OpenAI) para:
+   - determinar **dónde** ocurrió el hecho (no asume Tocoa ni Colón);
+   - corroborar los datos clave (✅ confirmado / ❓ no confirmado / ❌ contradicho, con fuentes);
+   - detectar noticias viejas, rumores, cadenas o material copiado de otro medio.
+   Te muestra un informe con veredicto (✅ apto / ⚠️ revisar / ⛔ no publicar) y las fuentes consultadas.
+4. Si no puede confirmar el lugar, te lo pregunta ("Ciudad, Departamento").
+5. Redacta usando solo datos del material o confirmados; atribuye lo no confirmado y no afirma lo contradicho.
+6. Revisa duplicados en el sitio. Si el veredicto es ⛔, pide confirmación extra antes de seguir.
+7. Eliges categorías, portada, revisas el preview y publicas (o editas).
+
+Comandos: `/listo`, `/cancelar`, `/start` (ayuda).
 
 ## 1. Crear el bot en Telegram
 
