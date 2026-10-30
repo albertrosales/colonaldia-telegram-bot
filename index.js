@@ -298,7 +298,11 @@ async function redactarNoticia(textoCrudo, verificacion, lugar, categorias, numI
           'familiares", "según el comunicado de...") o omítelos si son acusaciones graves.\n' +
           '- Personas señaladas de delitos: usa presunción de inocencia ("presunto", "supuesto").\n' +
           '- Puedes añadir contexto breve que el informe haya CONFIRMADO con fuentes.\n' +
-          '- El material puede ser largo y venir en varias partes: léelo completo y no omitas datos importantes.\n\n' +
+          '- Escribe la noticia como un hecho informado por el periódico. NUNCA menciones cómo llegó el material ' +
+          '(nota de voz, audio, video, mensaje, WhatsApp, captura, "según un audio", "en una grabación", ' +
+          '"se informó por mensaje"). Si alguien hace declaraciones, atribúyelas a esa persona o institución ' +
+          '("según la Policía", "declaró el alcalde"), no al medio por el que llegaron.\n' +
+          '- El material puede ser largo, venir en varias partes y en lenguaje hablado (transcripciones): léelo completo y no omitas datos importantes.\n\n' +
           'Responde SOLO un JSON con las claves: ' +
           '"titulo" (llamativo, informativo, sin comillas), ' +
           '"subtitulo" (una frase corta tipo bajada periodística, que amplíe el título sin repetirlo), ' +
@@ -355,7 +359,8 @@ async function editarNoticia({ titulo, subtitulo, descripcion, cuerpo }, instruc
           'igual, salvo que el cambio lo requiera. Conserva el dateline al inicio del cuerpo ("Ciudad, ' +
           'Departamento: -") salvo que el cambio pedido lo afecte directamente (por ejemplo, si corrige el lugar). ' +
           'Si el cuerpo contiene marcadores tipo {{IMG_2}}, {{IMG_3}}, etc., consérvalos en su lugar salvo que el ' +
-          'cambio los afecte. Responde SOLO el JSON actualizado con esas mismas cuatro claves.',
+          'cambio los afecte. Nunca menciones notas de voz, audios, videos ni mensajes como origen de la información. ' +
+          'Responde SOLO el JSON actualizado con esas mismas cuatro claves.',
       },
       { role: 'user', content: JSON.stringify({ titulo, subtitulo, descripcion, cuerpo }) },
       { role: 'user', content: `Cambio pedido: ${instruccion}` },
@@ -1033,8 +1038,8 @@ async function manejarTexto(ctx, texto, { esAudio = false, esVideo = false } = {
     return;
   }
 
-  const etiqueta = esVideo ? '(Transcripción del audio de un video) ' : esAudio ? '(Transcripción de nota de voz) ' : '';
-  await agregarMaterial(ctx, { texto: etiqueta + texto });
+  // El material va sin etiquetas: la noticia no debe mencionar cómo llegó la información
+  await agregarMaterial(ctx, { texto });
 }
 
 // ── Notas de voz, audios y videonotas ───────────────────────────────────────
