@@ -18,6 +18,9 @@ Bot de Telegram que recibe una noticia cruda (texto + foto opcional), la redacta
 5. Redacta usando solo datos del material o confirmados; atribuye lo no confirmado y no afirma lo contradicho.
 6. Revisa duplicados en el sitio. Si el veredicto es ⛔, pide confirmación extra antes de seguir.
 7. Eliges categorías, portada, revisas el preview y publicas (o editas).
+8. **X (opcional):** después de publicar, redacta un tuit con el enlace y la foto de portada.
+   Tú lo revisas y eliges 🐦 Publicar en X, ✏️ Editar tuit o ⏭️ No publicar en X.
+   Se activa al poner `X_API_KEY`, `X_API_SECRET`, `X_ACCESS_TOKEN` y `X_ACCESS_SECRET` en Render.
 
 Comandos: `/listo`, `/cancelar`, `/start` (ayuda).
 

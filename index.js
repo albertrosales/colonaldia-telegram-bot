@@ -4,6 +4,7 @@ import { Telegraf, Markup } from 'telegraf';
 import OpenAI from 'openai';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
+import { TwitterApi } from 'twitter-api-v2';
 
 // ── Config desde variables de entorno ────────────────────────────────────
 const {
@@ -22,6 +23,18 @@ const {
 // Modelo rápido: tareas simples (palabras clave, comparar duplicados).
 const MODELO_PRINCIPAL = process.env.OPENAI_MODEL || 'gpt-5.4';
 const MODELO_RAPIDO = process.env.OPENAI_MODEL_RAPIDO || 'gpt-4o-mini';
+
+// X (Twitter): opcional. Si faltan las credenciales, el bot simplemente no ofrece publicar en X.
+const { X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET } = process.env;
+const X_INCLUIR_ENLACE = (process.env.X_INCLUIR_ENLACE || 'si').toLowerCase() !== 'no';
+const xClient = (X_API_KEY && X_API_SECRET && X_ACCESS_TOKEN && X_ACCESS_SECRET)
+  ? new TwitterApi({
+      appKey: X_API_KEY,
+      appSecret: X_API_SECRET,
+      accessToken: X_ACCESS_TOKEN,
+      accessSecret: X_ACCESS_SECRET,
+    }).readWrite
+  : null;
 const ZONA_HORARIA = 'America/Tegucigalpa';
 
 if (!TELEGRAM_BOT_TOKEN || !OPENAI_API_KEY || !WP_URL || !WP_USER || !WP_APP_PASSWORD) {
@@ -431,7 +444,8 @@ function nuevoBorrador() {
 function obtenerBorradorRecopilando(ctx) {
   let draft = drafts.get(ctx.chat.id);
   if (draft && draft.stage === 'recopilando') return { draft, descartado: false };
-  const descartado = !!draft;
+  // Si lo pendiente era solo el tuit (la noticia ya está publicada), no es una noticia perdida
+  const descartado = !!draft && !String(draft.stage).startsWith('x_');
   draft = nuevoBorrador();
   drafts.set(ctx.chat.id, draft);
   return { draft, descartado };
@@ -688,6 +702,126 @@ async function mostrarPreviewFinal(ctx, draft) {
   ]));
 }
 
+// ══════════════════════════════════════════════════════════════════════════
+//  X (TWITTER)
+// ══════════════════════════════════════════════════════════════════════════
+const X_LIMITE = 280;
+const X_LARGO_ENLACE = 23; // X cuenta cualquier enlace como 23 caracteres
+
+// Largo aproximado según X: los emojis y caracteres fuera de BMP cuentan doble
+function largoX(texto) {
+  return Array.from(texto).reduce((n, ch) => n + (ch.codePointAt(0) > 0xffff ? 2 : 1), 0);
+}
+
+function recortarParaX(texto, maximo) {
+  if (largoX(texto) <= maximo) return texto;
+  let recortado = texto;
+  while (largoX(recortado + '…') > maximo) {
+    const corte = recortado.lastIndexOf(' ');
+    recortado = corte > 0 ? recortado.slice(0, corte) : recortado.slice(0, -1);
+  }
+  return recortado.trimEnd() + '…';
+}
+
+function maximoTextoTuit() {
+  return X_INCLUIR_ENLACE ? X_LIMITE - X_LARGO_ENLACE - 2 : X_LIMITE;
+}
+
+function armarTuit(texto, link) {
+  const cuerpo = recortarParaX(texto.trim(), maximoTextoTuit());
+  return X_INCLUIR_ENLACE && link ? `${cuerpo}\n\n${link}` : cuerpo;
+}
+
+async function redactarTuit({ titulo, descripcion, cuerpo, lugar }) {
+  const maximo = maximoTextoTuit() - 10; // margen de seguridad
+  const completion = await openai.chat.completions.create({
+    model: MODELO_RAPIDO,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Eres el community manager de un medio de noticias regional de Colón, Honduras. Escribe UN tuit para ' +
+          'difundir esta noticia ya publicada. Reglas: informativo y directo, en español de Honduras; que diga qué ' +
+          'pasó y dónde; sin exagerar ni agregar datos que no estén en la noticia; sin clickbait engañoso; ' +
+          'presunción de inocencia ("presunto") si hay personas señaladas de delitos; puede empezar con un emoji ' +
+          'adecuado (ej: 🔴 para hechos urgentes, 📍 para lugar) y llevar como máximo 2 hashtags relevantes al ' +
+          `final. NO incluyas enlaces (se agregan aparte). Máximo ${maximo} caracteres. ` +
+          'Responde SOLO un JSON: {"tuit": "..."}',
+      },
+      {
+        role: 'user',
+        content: JSON.stringify({ titulo, descripcion, lugar: textoLugar(lugar), cuerpo: cuerpo?.slice(0, 4000) }),
+      },
+    ],
+  });
+  return JSON.parse(completion.choices[0].message.content).tuit || titulo;
+}
+
+async function editarTuit(textoActual, instruccion) {
+  const maximo = maximoTextoTuit() - 10;
+  const completion = await openai.chat.completions.create({
+    model: MODELO_RAPIDO,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'Tienes un tuit de un medio de noticias. El editor te manda un mensaje: si es un tuit completo ya ' +
+          'escrito por él, úsalo tal cual (sin cambiar palabras); si es una instrucción ("más corto", "quita el ' +
+          'hashtag", "menciona que..."), aplícala al tuit actual. No agregues enlaces. ' +
+          `Máximo ${maximo} caracteres. Responde SOLO un JSON: {"tuit": "..."}`,
+      },
+      { role: 'user', content: `Tuit actual: ${textoActual}\n\nMensaje del editor: ${instruccion}` },
+    ],
+  });
+  return JSON.parse(completion.choices[0].message.content).tuit || textoActual;
+}
+
+async function mostrarPreviewTuit(ctx, draft) {
+  const tuit = armarTuit(draft.x.texto, draft.x.link);
+  const largo = largoX(draft.x.texto.trim()) + (X_INCLUIR_ENLACE ? X_LARGO_ENLACE + 2 : 0);
+  const html =
+    '🐦 <b>Tuit para X</b>\n\n' +
+    `${esc(tuit)}\n\n` +
+    `<i>${Math.min(largo, X_LIMITE)}/${X_LIMITE} caracteres` +
+    `${draft.x.foto ? ' · con la foto de portada' : ' · sin foto'}</i>`;
+  await enviarLargo(ctx, html, Markup.inlineKeyboard([
+    [Markup.button.callback('🐦 Publicar en X', 'x_publicar')],
+    [Markup.button.callback('✏️ Editar tuit', 'x_editar')],
+    [Markup.button.callback('⏭️ No publicar en X', 'x_omitir')],
+  ]));
+}
+
+async function publicarEnX(draft) {
+  let mediaIds;
+  let avisoFoto = '';
+  if (draft.x.foto) {
+    try {
+      const mediaId = await xClient.v2.uploadMedia(draft.x.foto, { media_type: 'image/jpeg' });
+      mediaIds = [mediaId];
+    } catch (err) {
+      console.error('Error subiendo foto a X:', err);
+      avisoFoto = ' (no se pudo subir la foto, se publicó sin imagen)';
+    }
+  }
+  const { data } = await xClient.v2.tweet({
+    text: armarTuit(draft.x.texto, draft.x.link),
+    ...(mediaIds ? { media: { media_ids: mediaIds } } : {}),
+  });
+  return { url: `https://x.com/i/web/status/${data.id}`, avisoFoto };
+}
+
+function describirErrorX(err) {
+  const codigo = err?.code || err?.data?.status;
+  if (codigo === 401) return 'credenciales de X inválidas (revisa X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN y X_ACCESS_SECRET).';
+  if (codigo === 402) return 'la cuenta de desarrollador de X no tiene saldo/créditos para publicar.';
+  if (codigo === 403) return 'X rechazó el tuit (permisos de la app en "Read and write", tuit duplicado o contenido no permitido). ' +
+    (err?.data?.detail || '');
+  if (codigo === 429) return 'se alcanzó el límite de publicaciones de X; intenta más tarde.';
+  return err?.data?.detail || err?.message || String(err);
+}
+
 // Ejecuta un proceso largo sin bloquear el webhook de Telegram
 function enSegundoPlano(ctx, draft, fn) {
   fn().catch(async (err) => {
@@ -758,6 +892,21 @@ bot.on('text', async (ctx) => {
       : { ciudad: partes[0], departamento: partes[1] || '', pais: 'Honduras' };
     enSegundoPlano(ctx, draft, () => continuarConRedaccion(ctx, draft));
     return;
+  }
+
+  if (draft?.stage === 'x_editando') {
+    enSegundoPlano(ctx, draft, async () => {
+      draft.stage = 'x_procesando';
+      await ctx.reply('Ajustando el tuit...');
+      draft.x.texto = await editarTuit(draft.x.texto, texto);
+      draft.stage = 'x_revisando';
+      await mostrarPreviewTuit(ctx, draft);
+    });
+    return;
+  }
+
+  if (draft?.stage === 'x_procesando') {
+    return ctx.reply('⏳ Estoy trabajando en el tuit, espera un momento.');
   }
 
   if (draft?.stage === 'editando') {
@@ -943,13 +1092,72 @@ bot.action(/^autor_(\d+)$/, async (ctx) => {
       sticky: draft.portada,
     });
 
-    drafts.delete(ctx.chat.id);
     await ctx.reply(`✅ Publicado: ${post.link}`);
+
+    if (!xClient) {
+      drafts.delete(ctx.chat.id);
+      return;
+    }
+
+    // Preparar el tuit (la noticia ya está publicada; esto es solo para X)
+    draft.stage = 'x_procesando';
+    draft.x = { link: post.link, foto: draft.fotos[0]?.buffer || null, texto: '' };
+    try {
+      draft.x.texto = await redactarTuit(draft);
+    } catch (err) {
+      console.error('Error redactando tuit:', err);
+      draft.x.texto = draft.titulo;
+    }
+    draft.stage = 'x_revisando';
+    await mostrarPreviewTuit(ctx, draft);
   } catch (err) {
     console.error(err);
     draft.stage = 'preview';
     await ctx.reply(`Error al publicar: ${err.message}`);
   }
+});
+
+// ── X: publicar / editar / omitir ──────────────────────────────────────────
+bot.action('x_publicar', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (!draft || draft.stage !== 'x_revisando' || !xClient) return ctx.answerCbQuery('No hay ningún tuit pendiente.');
+
+  draft.stage = 'x_procesando';
+  await ctx.answerCbQuery();
+  await ctx.reply('Publicando en X...');
+  try {
+    const { url, avisoFoto } = await publicarEnX(draft);
+    drafts.delete(ctx.chat.id);
+    await ctx.reply(`✅ Publicado en X${avisoFoto}: ${url}`);
+  } catch (err) {
+    console.error('Error publicando en X:', err);
+    draft.stage = 'x_revisando';
+    await ctx.reply(`❌ No se pudo publicar en X: ${describirErrorX(err)}`, Markup.inlineKeyboard([
+      [Markup.button.callback('🔁 Reintentar', 'x_publicar')],
+      [Markup.button.callback('⏭️ No publicar en X', 'x_omitir')],
+    ]));
+  }
+});
+
+bot.action('x_editar', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (!draft || draft.stage !== 'x_revisando') return ctx.answerCbQuery('No hay ningún tuit pendiente.');
+  draft.stage = 'x_editando';
+  await ctx.answerCbQuery();
+  await ctx.reply(
+    '✏️ Escribe el tuit como lo quieres, o dime qué cambiar (ej: "más corto", "quita los hashtags", ' +
+    '"empieza con 🔴 ÚLTIMA HORA"). El enlace se agrega solo.'
+  );
+});
+
+bot.action('x_omitir', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.answerCbQuery('No autorizado.');
+  const draft = drafts.get(ctx.chat.id);
+  if (draft && String(draft.stage).startsWith('x_')) drafts.delete(ctx.chat.id);
+  await ctx.answerCbQuery('Listo');
+  await ctx.reply('👍 No se publicó en X. La noticia ya está en el sitio.');
 });
 
 // ── Cancelar ─────────────────────────────────────────────────────────────
@@ -977,6 +1185,9 @@ app.get('/', (req, res) => res.send('Bot activo.'));
 app.listen(PORT, async () => {
   console.log(`Servidor escuchando en el puerto ${PORT}`);
   console.log(`Modelo principal: ${MODELO_PRINCIPAL} | Modelo rápido: ${MODELO_RAPIDO}`);
+  console.log(xClient
+    ? `Publicación en X: activada (${X_INCLUIR_ENLACE ? 'con' : 'sin'} enlace)`
+    : 'Publicación en X: desactivada (faltan credenciales X_*)');
   if (RENDER_EXTERNAL_URL) {
     const webhookUrl = `${RENDER_EXTERNAL_URL}${webhookPath}`;
     await bot.telegram.setWebhook(webhookUrl);
