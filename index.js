@@ -980,7 +980,7 @@ app.listen(PORT, async () => {
   if (RENDER_EXTERNAL_URL) {
     const webhookUrl = `${RENDER_EXTERNAL_URL}${webhookPath}`;
     await bot.telegram.setWebhook(webhookUrl);
-    console.log(`Webhook configurado en: ${webhookUrl}`);
+    console.log(`Webhook configurado en: ${RENDER_EXTERNAL_URL}/telegraf/***`);
   } else {
     console.log('RENDER_EXTERNAL_URL no está definida: configura el webhook manualmente si no estás en Render.');
   }
