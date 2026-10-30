@@ -887,9 +887,13 @@ async function transcribirAudio(buffer, nombreArchivo) {
   return (resultado.text || '').trim();
 }
 
-async function manejarAudio(ctx, fileId, nombreArchivo, tamano) {
+async function manejarAudio(ctx, fileId, nombreArchivo, tamano, { esVideo = false } = {}) {
   if (tamano && tamano > 20 * 1024 * 1024) {
-    return ctx.reply('El audio es muy grande (Telegram deja descargar hasta 20 MB). Mándalo más corto o en partes.');
+    const mb = Math.round(tamano / 1024 / 1024);
+    return ctx.reply(esVideo
+      ? `El video pesa ${mb} MB y Telegram solo deja a los bots descargar hasta 20 MB. ` +
+        'Mándame solo el audio (o una nota de voz contando la noticia), o el video comprimido/recortado.'
+      : `El audio pesa ${mb} MB y Telegram solo deja a los bots descargar hasta 20 MB. Mándalo más corto o en partes.`);
   }
   const draft = drafts.get(ctx.chat.id);
   if (draft?.stage === 'procesando' || draft?.stage === 'x_procesando') {
@@ -897,18 +901,24 @@ async function manejarAudio(ctx, fileId, nombreArchivo, tamano) {
   }
   // Se procesa aparte para no bloquear a Telegram mientras se transcribe
   (async () => {
-    const aviso = await ctx.reply('🎙️ Transcribiendo audio...');
+    const aviso = await ctx.reply(esVideo ? '🎬 Transcribiendo el audio del video...' : '🎙️ Transcribiendo audio...');
     try {
       const buffer = await descargarArchivo(ctx.telegram, fileId);
       const texto = await transcribirAudio(buffer, nombreArchivo);
       ctx.telegram.deleteMessage(ctx.chat.id, aviso.message_id).catch(() => {});
-      if (!texto) return ctx.reply('No entendí nada en el audio. ¿Puedes repetirlo con menos ruido?');
+      if (!texto) {
+        return ctx.reply(esVideo
+          ? 'El video no tiene voz que pueda transcribir. Mándame el texto de la noticia o una nota de voz.'
+          : 'No entendí nada en el audio. ¿Puedes repetirlo con menos ruido?');
+      }
       await enviarLargo(ctx, `🎙️ <b>Transcripción:</b>\n<i>${esc(texto)}</i>`);
-      await manejarTexto(ctx, texto, { esAudio: true });
+      await manejarTexto(ctx, texto, { esAudio: true, esVideo });
     } catch (err) {
       console.error('Error transcribiendo audio:', err);
       ctx.telegram.deleteMessage(ctx.chat.id, aviso.message_id).catch(() => {});
-      await ctx.reply(`No pude transcribir el audio: ${err.message}`);
+      await ctx.reply(esVideo
+        ? `No pude sacar el audio del video (${err.message}). Si no tiene voz, mándame el texto o una nota de voz.`
+        : `No pude transcribir el audio: ${err.message}`);
     }
   })().catch(console.error);
 }
@@ -973,7 +983,7 @@ bot.on('text', async (ctx) => {
 
 // Texto escrito o transcrito de un audio: según el paso en que va la noticia,
 // es material nuevo, el lugar del hecho o un cambio pedido.
-async function manejarTexto(ctx, texto, { esAudio = false } = {}) {
+async function manejarTexto(ctx, texto, { esAudio = false, esVideo = false } = {}) {
   const draft = drafts.get(ctx.chat.id);
 
   if (draft?.stage === 'procesando') {
@@ -1023,7 +1033,8 @@ async function manejarTexto(ctx, texto, { esAudio = false } = {}) {
     return;
   }
 
-  await agregarMaterial(ctx, { texto: esAudio ? `(Transcripción de nota de voz) ${texto}` : texto });
+  const etiqueta = esVideo ? '(Transcripción del audio de un video) ' : esAudio ? '(Transcripción de nota de voz) ' : '';
+  await agregarMaterial(ctx, { texto: etiqueta + texto });
 }
 
 // ── Notas de voz, audios y videonotas ───────────────────────────────────────
@@ -1037,6 +1048,14 @@ bot.on('audio', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
   const a = ctx.message.audio;
   await manejarAudio(ctx, a.file_id, a.file_name || 'audio.mp3', a.file_size);
+});
+
+bot.on('video', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const v = ctx.message.video;
+  // El texto que acompaña al video (pie) también es material
+  if (ctx.message.caption) await manejarTexto(ctx, ctx.message.caption);
+  await manejarAudio(ctx, v.file_id, v.file_name || 'video.mp4', v.file_size, { esVideo: true });
 });
 
 bot.on('video_note', async (ctx) => {
@@ -1071,6 +1090,11 @@ bot.on('document', async (ctx) => {
 
   if (mime.startsWith('audio/') || /\.(mp3|m4a|ogg|oga|opus|wav|aac|webm)$/i.test(nombre)) {
     return manejarAudio(ctx, doc.file_id, nombre || 'audio.ogg', doc.file_size);
+  }
+
+  if (mime.startsWith('video/') || /\.(mp4|mov|mpeg|mpg)$/i.test(nombre)) {
+    // OpenAI no acepta la extensión .mov; los .mov de celular son compatibles con mp4
+    return manejarAudio(ctx, doc.file_id, (nombre || 'video.mp4').replace(/\.mov$/i, '.mp4'), doc.file_size, { esVideo: true });
   }
 
   if (mime.startsWith('text/') || /\.(txt|md)$/i.test(nombre)) {
