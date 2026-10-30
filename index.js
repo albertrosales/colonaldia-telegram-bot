@@ -151,7 +151,8 @@ async function verificarNoticia(textoCrudo) {
     `"contradicho" (fuentes confiables dicen otra cosa; indica el dato correcto en "dato_correcto").\n` +
     `3. ALERTAS: señala si parece noticia vieja reciclada, rumor, cadena de WhatsApp, sátira, imagen o dato ` +
     `manipulado, acusaciones graves sin respaldo, o si el material parece copiado de otro medio (indica cuál).\n` +
-    `4. VEREDICTO: "apto" (lo esencial está confirmado o es un hecho local verosímil sin contradicciones), ` +
+    `4. VEREDICTO: "apto" (lo esencial está confirmado, o es un hecho local verosímil sin contradicciones: las ` +
+    `noticias locales pequeñas casi nunca aparecen en internet y eso NO las vuelve dudosas), ` +
     `"revisar" (hay datos sin confirmar importantes o dudas) o "no_publicar" (falso, contradicho en lo ` +
     `esencial, viejo presentado como nuevo, o acusación grave sin ningún respaldo).\n\n` +
     `Nunca inventes fuentes: en "fuentes" pon solo URLs que realmente encontraste en la búsqueda.\n\n` +
@@ -289,22 +290,36 @@ async function redactarNoticia(textoCrudo, verificacion, lugar, categorias, numI
           'Eres redactor de colonaldia.hn, un periódico regional con sede en Tocoa, Colón, Honduras. ' +
           `Hoy es ${fechaHoy()}. Redacta una noticia lista para publicar a partir del material crudo y del ` +
           'informe de verificación que te doy.\n\n' +
-          'Reglas de rigor periodístico (obligatorias):\n' +
-          '- Usa SOLO hechos que estén en el material o en el informe de verificación. No inventes nombres, cifras, ' +
-          'fechas, citas ni detalles.\n' +
-          '- Hechos "contradicho": NO los afirmes. Si el informe trae el dato correcto de una fuente confiable, usa ' +
-          'el dato correcto; si no, omítelos.\n' +
-          '- Hechos "no_confirmado": atribúyelos ("según información preliminar", "según reportes", "según ' +
-          'familiares", "según el comunicado de...") o omítelos si son acusaciones graves.\n' +
-          '- Personas señaladas de delitos: usa presunción de inocencia ("presunto", "supuesto").\n' +
-          '- Puedes añadir contexto breve que el informe haya CONFIRMADO con fuentes.\n' +
+          'El material crudo es la reportería del propio periódico (lo mandan sus periodistas y corresponsales). ' +
+          'El informe de verificación es una herramienta INTERNA para el editor: el lector nunca debe notarlo.\n\n' +
+          'Reglas (obligatorias):\n' +
+          '- Redacta en tono afirmativo y directo, en indicativo: "La Municipalidad instaló...", no "habría ' +
+          'instalado". Que un hecho local no aparezca en internet ("no_confirmado") es NORMAL y NO es motivo para ' +
+          'dudar ni condicionar el texto.\n' +
+          '- PROHIBIDO hablar del proceso de verificación o de las fuentes en NINGÚN campo (título, subtítulo, ' +
+          'descripción ni cuerpo): nada de "información ' +
+          'preliminar", "no se ha podido confirmar", "de manera independiente", "fuentes oficiales", "documentación ' +
+          'verificable", "según reportes conocidos", "hasta el momento no se ha establecido", "sí está confirmado que". ' +
+          'Si un dato no está claro, simplemente no lo escribas.\n' +
+          '- No inventes nombres, cifras, fechas, citas ni detalles: usa solo lo que dice el material o el informe.\n' +
+          '- Hechos "contradicho" en el informe: no los afirmes. Usa el dato correcto si el informe lo trae de una ' +
+          'fuente confiable; si no, omítelos.\n' +
+          '- Atribuye solo cuando la información viene de alguien concreto y es delicada: cifras de víctimas, ' +
+          'causas de un accidente o delito, acusaciones ("según la Policía", "informó el Cuerpo de Bomberos", ' +
+          '"según familiares"). Personas señaladas de delitos: "presunto", "supuesto".\n' +
+          '- No rellenes con obviedades ni contexto que no aporta (que la institución existe, por dónde pasa una ' +
+          'carretera, etc.). Solo añade contexto confirmado si de verdad ayuda a entender la noticia.\n' +
+          '- Estilo de periódico regional: primer párrafo con qué pasó, quién, dónde y cuándo (si se sabe); luego ' +
+          'detalles, declaraciones y contexto útil. Frases claras, sin adornos. La extensión la marca el material: ' +
+          'una noticia corta puede tener 2 o 3 párrafos.\n' +
           '- Escribe la noticia como un hecho informado por el periódico. NUNCA menciones cómo llegó el material ' +
           '(nota de voz, audio, video, mensaje, WhatsApp, captura, "según un audio", "en una grabación", ' +
           '"se informó por mensaje"). Si alguien hace declaraciones, atribúyelas a esa persona o institución ' +
           '("según la Policía", "declaró el alcalde"), no al medio por el que llegaron.\n' +
           '- El material puede ser largo, venir en varias partes y en lenguaje hablado (transcripciones): léelo completo y no omitas datos importantes.\n\n' +
           'Responde SOLO un JSON con las claves: ' +
-          '"titulo" (llamativo, informativo, sin comillas), ' +
+          '"titulo" (informativo y concreto: quién hizo qué y dónde; sin comillas; evita arranques vagos como ' +
+          '"Reportan", "Informan" o "Se conoce"), ' +
           '"subtitulo" (una frase corta tipo bajada periodística, que amplíe el título sin repetirlo), ' +
           '"descripcion" (resumen de 1-2 frases para SEO/redes), ' +
           '"cuerpo" (noticia completa en formato periodístico, párrafos separados por doble salto de línea. ' +
