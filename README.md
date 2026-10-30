@@ -7,7 +7,8 @@ Bot de Telegram que recibe una noticia cruda (texto + foto opcional), la redacta
 ## Cómo funciona
 
 1. Le mandas al bot el material: texto (aunque sea largo y Telegram lo parta en varios mensajes),
-   fotos sueltas o en álbum, o un archivo `.txt`. Todo se junta en un solo borrador.
+   notas de voz o audios 🎙️ (los transcribe con OpenAI), fotos sueltas o en álbum, o un archivo `.txt`.
+   También puedes responder con audio cuando te pide el lugar o un cambio. Todo se junta en un solo borrador.
 2. Tocas **✍️ Redactar** (o escribes `/listo`).
 3. **Verificación:** la IA investiga en la web (herramienta `web_search` de OpenAI) para:
    - determinar **dónde** ocurrió el hecho (no asume Tocoa ni Colón);

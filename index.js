@@ -1,7 +1,7 @@
 import 'dotenv/config';
 import express from 'express';
 import { Telegraf, Markup } from 'telegraf';
-import OpenAI from 'openai';
+import OpenAI, { toFile } from 'openai';
 import fetch from 'node-fetch';
 import FormData from 'form-data';
 import { TwitterApi } from 'twitter-api-v2';
@@ -23,6 +23,7 @@ const {
 // Modelo rápido: tareas simples (palabras clave, comparar duplicados).
 const MODELO_PRINCIPAL = process.env.OPENAI_MODEL || 'gpt-5.4';
 const MODELO_RAPIDO = process.env.OPENAI_MODEL_RAPIDO || 'gpt-4o-mini';
+const MODELO_TRANSCRIPCION = process.env.OPENAI_MODEL_TRANSCRIPCION || 'gpt-4o-transcribe';
 
 // X (Twitter): opcional. Si faltan las credenciales, el bot simplemente no ofrece publicar en X.
 const { X_API_KEY, X_API_SECRET, X_ACCESS_TOKEN, X_ACCESS_SECRET } = process.env;
@@ -838,6 +839,80 @@ function describirErrorX(err) {
   return err?.data?.detail || err?.message || String(err);
 }
 
+// Convierte lo que el editor escribió o dijo ("es en Trujillo, Colón", "San Pedro Sula")
+// en { ciudad, departamento, pais }
+async function interpretarLugar(texto) {
+  const completion = await openai.chat.completions.create({
+    model: MODELO_RAPIDO,
+    response_format: { type: 'json_object' },
+    messages: [
+      {
+        role: 'system',
+        content:
+          'El editor de un periódico hondureño indica dónde ocurrió una noticia. Extrae el lugar. Si es en ' +
+          'Honduras, completa el departamento si es obvio por la ciudad (ej: Trujillo → Colón, San Pedro Sula → ' +
+          'Cortés). Respeta lo que dijo el editor; no inventes. Responde SOLO un JSON: ' +
+          '{"ciudad": "", "departamento": "", "pais": ""}. Si no menciona ningún lugar, ciudad vacía.',
+      },
+      { role: 'user', content: texto },
+    ],
+  });
+  const l = JSON.parse(completion.choices[0].message.content);
+  return { ciudad: (l.ciudad || '').trim(), departamento: (l.departamento || '').trim(), pais: (l.pais || 'Honduras').trim() };
+}
+
+// ══════════════════════════════════════════════════════════════════════════
+//  NOTAS DE VOZ / AUDIOS
+// ══════════════════════════════════════════════════════════════════════════
+const PISTAS_TRANSCRIPCION =
+  'Noticia de Colón, Honduras. Lugares: Tocoa, Trujillo, Sabá, Bonito Oriental, Sonaguera, Balfate, Limón, ' +
+  'Iriona, Santa Fe, Santa Rosa de Aguán, Valle del Aguán, Francisco Morazán, Tegucigalpa, San Pedro Sula, ' +
+  'La Ceiba. Instituciones: Policía Nacional, DPI, Ministerio Público, COPECO, alcaldía, regidor, diputado.';
+
+async function transcribirAudio(buffer, nombreArchivo) {
+  const intentar = async (model) => openai.audio.transcriptions.create({
+    file: await toFile(buffer, nombreArchivo),
+    model,
+    language: 'es',
+    prompt: PISTAS_TRANSCRIPCION,
+  });
+  let resultado;
+  try {
+    resultado = await intentar(MODELO_TRANSCRIPCION);
+  } catch (err) {
+    if (MODELO_TRANSCRIPCION === 'whisper-1') throw err;
+    console.error(`Falló ${MODELO_TRANSCRIPCION}, reintentando con whisper-1:`, err.message);
+    resultado = await intentar('whisper-1');
+  }
+  return (resultado.text || '').trim();
+}
+
+async function manejarAudio(ctx, fileId, nombreArchivo, tamano) {
+  if (tamano && tamano > 20 * 1024 * 1024) {
+    return ctx.reply('El audio es muy grande (Telegram deja descargar hasta 20 MB). Mándalo más corto o en partes.');
+  }
+  const draft = drafts.get(ctx.chat.id);
+  if (draft?.stage === 'procesando' || draft?.stage === 'x_procesando') {
+    return ctx.reply('⏳ Estoy trabajando en la noticia, espera un momento.');
+  }
+  // Se procesa aparte para no bloquear a Telegram mientras se transcribe
+  (async () => {
+    const aviso = await ctx.reply('🎙️ Transcribiendo audio...');
+    try {
+      const buffer = await descargarArchivo(ctx.telegram, fileId);
+      const texto = await transcribirAudio(buffer, nombreArchivo);
+      ctx.telegram.deleteMessage(ctx.chat.id, aviso.message_id).catch(() => {});
+      if (!texto) return ctx.reply('No entendí nada en el audio. ¿Puedes repetirlo con menos ruido?');
+      await enviarLargo(ctx, `🎙️ <b>Transcripción:</b>\n<i>${esc(texto)}</i>`);
+      await manejarTexto(ctx, texto, { esAudio: true });
+    } catch (err) {
+      console.error('Error transcribiendo audio:', err);
+      ctx.telegram.deleteMessage(ctx.chat.id, aviso.message_id).catch(() => {});
+      await ctx.reply(`No pude transcribir el audio: ${err.message}`);
+    }
+  })().catch(console.error);
+}
+
 // Ejecuta un proceso largo sin bloquear el webhook de Telegram
 function enSegundoPlano(ctx, draft, fn) {
   fn().catch(async (err) => {
@@ -859,7 +934,9 @@ function enSegundoPlano(ctx, draft, fn) {
 // ══════════════════════════════════════════════════════════════════════════
 const AYUDA =
   '👋 Mándame la noticia: puedes pegar textos largos (aunque Telegram los parta en varios mensajes), ' +
-  'enviar varias fotos o un álbum, o un archivo .txt. Todo se junta en un solo borrador.\n\n' +
+  'enviar varias fotos o un álbum, notas de voz 🎙️ (las transcribo), o un archivo .txt. ' +
+  'Todo se junta en un solo borrador.\n\n' +
+  'También puedes responder con audio cuando te pida el lugar o un cambio.\n\n' +
   'Cuando termines, toca ✍️ Redactar (o escribe /listo). Antes de redactar, investigo el hecho en la web, ' +
   'confirmo dónde ocurrió y corroboro los datos.\n\n' +
   'Comandos: /listo para redactar, /cancelar para descartar.';
@@ -891,22 +968,29 @@ bot.command('cancelar', async (ctx) => {
 // ── Mensajes de texto ──────────────────────────────────────────────────────
 bot.on('text', async (ctx) => {
   if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  await manejarTexto(ctx, ctx.message.text);
+});
 
+// Texto escrito o transcrito de un audio: según el paso en que va la noticia,
+// es material nuevo, el lugar del hecho o un cambio pedido.
+async function manejarTexto(ctx, texto, { esAudio = false } = {}) {
   const draft = drafts.get(ctx.chat.id);
-  const texto = ctx.message.text;
 
   if (draft?.stage === 'procesando') {
     return ctx.reply('⏳ Estoy trabajando en la noticia, espera un momento.');
   }
 
   if (draft?.stage === 'esperando_lugar') {
-    const partes = texto.split(',').map(p => p.trim()).filter(Boolean);
-    if (!partes.length) return ctx.reply('Escríbeme el lugar así: Ciudad, Departamento.');
-    const esExtranjero = partes[1] && !/^(atl[aá]ntida|choluteca|col[oó]n|comayagua|cop[aá]n|cort[eé]s|el para[ií]so|francisco moraz[aá]n|gracias a dios|intibuc[aá]|islas de la bah[ií]a|la paz|lempira|ocotepeque|olancho|santa b[aá]rbara|valle|yoro)$/i.test(partes[1]);
-    draft.lugar = esExtranjero
-      ? { ciudad: partes[0], departamento: '', pais: partes[1] }
-      : { ciudad: partes[0], departamento: partes[1] || '', pais: 'Honduras' };
-    enSegundoPlano(ctx, draft, () => continuarConRedaccion(ctx, draft));
+    enSegundoPlano(ctx, draft, async () => {
+      draft.stage = 'procesando';
+      const lugar = await interpretarLugar(texto);
+      if (!lugar.ciudad) {
+        draft.stage = 'esperando_lugar';
+        return ctx.reply('No entendí el lugar. Escríbelo así: Ciudad, Departamento (ej: "Trujillo, Colón").');
+      }
+      draft.lugar = lugar;
+      await continuarConRedaccion(ctx, draft);
+    });
     return;
   }
 
@@ -939,7 +1023,26 @@ bot.on('text', async (ctx) => {
     return;
   }
 
-  await agregarMaterial(ctx, { texto });
+  await agregarMaterial(ctx, { texto: esAudio ? `(Transcripción de nota de voz) ${texto}` : texto });
+}
+
+// ── Notas de voz, audios y videonotas ───────────────────────────────────────
+bot.on('voice', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const v = ctx.message.voice;
+  await manejarAudio(ctx, v.file_id, 'nota.ogg', v.file_size);
+});
+
+bot.on('audio', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const a = ctx.message.audio;
+  await manejarAudio(ctx, a.file_id, a.file_name || 'audio.mp3', a.file_size);
+});
+
+bot.on('video_note', async (ctx) => {
+  if (!isAllowed(ctx)) return ctx.reply('No autorizado.');
+  const v = ctx.message.video_note;
+  await manejarAudio(ctx, v.file_id, 'videonota.mp4', v.file_size);
 });
 
 // ── Fotos (sueltas o en álbum) ─────────────────────────────────────────────
@@ -966,6 +1069,10 @@ bot.on('document', async (ctx) => {
     return agregarMaterial(ctx, { texto: ctx.message.caption || '', fotoId: doc.file_id });
   }
 
+  if (mime.startsWith('audio/') || /\.(mp3|m4a|ogg|oga|opus|wav|aac|webm)$/i.test(nombre)) {
+    return manejarAudio(ctx, doc.file_id, nombre || 'audio.ogg', doc.file_size);
+  }
+
   if (mime.startsWith('text/') || /\.(txt|md)$/i.test(nombre)) {
     if (doc.file_size > 2 * 1024 * 1024) return ctx.reply('El archivo es muy grande (máximo 2 MB).');
     try {
@@ -979,7 +1086,7 @@ bot.on('document', async (ctx) => {
     }
   }
 
-  return ctx.reply('Solo acepto archivos de texto (.txt) o imágenes. Para Word, copia y pega el texto.');
+  return ctx.reply('Solo acepto archivos de texto (.txt), imágenes o audios. Para Word, copia y pega el texto.');
 });
 
 // ── Botón: Redactar ─────────────────────────────────────────────────────────
